@@ -251,7 +251,7 @@ para baixo (primeira regra que casa vence).
 | H11 | Sem progresso: > N turnos (ex.: 12) sem avançar de estado ou lead silencioso após 2 follow-ups | contadores | Baixa | Encaminha/encerra com cortesia |
 | H12 | Negociação fora da política (pede desconto, exceção de regra, cobertura inexistente) | intenção | Média | Humano decide; bot não promete |
 | H13 | Baixa confiança de NLU em slot crítico mesmo após reconfirmação | limiar de confiança | Média | Confirma com humano |
-| H14 | **(proposta da auditoria, Etapa 2.5)** Tentativa de prompt injection: sinal duro em `injection_signals` (override de instruções, exfiltração do system prompt, troca de papel, quebra de delimitador, manipulação de preço, burla de handoff, payload codificado) | `agent/prompt_safety.py` | Alta | Encaminha ao humano sem executar o pedido |
+| H14 | **Prompt injection REINCIDENTE** (2º sinal duro de `injection_signals` na mesma sessão). *O 1º sinal NÃO faz handoff nem chama o LLM*: resposta determinística que reconduz à cotação + contador de segurança. | `Session.security_strikes ≥ 2` | Alta | Neutra, sem acusar; pacote com `security_review=true` e fila `security_review` |
 
 Contrato do pacote de handoff (sempre mascarado): `conversation_id`, `handoff_reason`
 (código H1…H13), `from_state`, slots coletados não sensíveis, `quote_id`/status ou
@@ -341,3 +341,66 @@ marcas combinantes/seletores de variação deixando dígitos soltos (`5́2́[NUM
 - O system prompt é consultivo; a segurança não depende dele. O canário pega vazamento literal ou
   quase literal, não resumo semântico.
 - Falsos positivos de H14 existem em teoria; medido contra todas as mensagens de lead do dataset: 0.
+
+## 11. Etapa 3 — Máquina de estados, handoff e LLM (implementada)
+
+### 11.1 Refinamentos de arquiteto incorporados
+
+1. **H14 anti-DoS da fila humana.** 1º sinal duro: o agente **não chama o LLM, não extrai slots, não
+   faz handoff**; responde um texto fixo ("Não consigo ajudar com esse tipo de pedido, mas posso
+   seguir com a sua cotação…") + a pergunta do passo atual, e incrementa `security_strikes`. Só o
+   2º sinal duro dispara H14 (`security_review=true`, fila separada `security_review`). Medido em
+   teste: 20 sessões × 6 ataques ⇒ exatamente 20 tickets. Sinais moles (caracteres invisíveis,
+   blob codificado) nunca contam.
+2. **Guardrail de saída sem falso positivo em slots.** Só **valores monetários** são bloqueados
+   (`R$`, "reais", por extenso, "por mês/mensal", grátis, desconto); idade, ano do veículo,
+   `data_inicio`, prefixo de CEP e dias de carência passam. Sem `Quote`, qualquer valor monetário é
+   violação; com `Quote`, só os valores dele (prêmio, franquia, pro-rata). Testado com LLM simulado.
+3. **PII em runtime × logs/LLM.** O CEP completo é extraído do **texto cru antes do mascaramento** e
+   vive só em `Session.slots.cep` (memória volátil); é usado uma única vez, em
+   `Slots.to_quote_request()`. `repr`, `Slots.sanitized()`, `Session.to_record()`, pacote de handoff,
+   histórico, logs e prompts só veem `cep[:2]` / texto mascarado (`wrap_user_message`). Os demais
+   slots são extraídos do texto **mascarado**, de modo que dígitos de CPF/telefone nunca viram idade
+   ou ano.
+
+### 11.2 Módulos
+
+| Módulo | Papel |
+|---|---|
+| `agent/fsm.py` | `transition(state, event)` pura; qualquer par fora da tabela ⇒ `InvalidTransition`; terminais não se movem |
+| `agent/slots.py` | extração/validação em código, conflitos ⇒ `ambiguous`, citado-mas-inválido ⇒ `invalid`; CEP volátil |
+| `agent/intents.py` | léxicos determinísticos (confirmação, compra, objeção, reclamação, fora de escopo, negociação) |
+| `agent/render.py` | todos os textos ao lead; valores só do `Quote`; placeholders `[[PREMIO_MENSAL]]` etc. |
+| `agent/handoff.py` | códigos H1–H14 + C1, mensagens honestas, `HandoffPackage` mascarado, fila idempotente |
+| `agent/llm.py` | `LLMAdapter` (Null / Mock / Anthropic via httpx); `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT` |
+| `agent/conversation.py` | `Agent.handle_message`: ordem de avaliação, QuoteClient, guardrails, 1 turno por vez por conversa (lock) |
+
+### 11.3 Ordem de avaliação por mensagem (primeira regra que casa vence)
+
+sessão terminal ⇒ resposta fixa → gateway de privacidade (**H4**) → **H1** humano → **H2** reclamação →
+**H3** fora de escopo → injection (1º: redireciona; 2º: **H14**) → **H12** negociação → slots/estado
+(**H10**, **H13**, **H11**) → QuoteClient (**H5**, **H6**, **H7**, **H8**) → guardrails de saída (**H9**).
+
+| Gatilho | Onde é decidido | Observação |
+|---|---|---|
+| H1 | `explicit_human_request` | imune a ofuscação Unicode; "não quero humano" não conta |
+| H2 / H3 / H12 | `intents.complaint / out_of_scope / negotiation` | léxicos; 0 disparos nas mensagens de lead do dataset |
+| H4 | `MaskingError` / `PIILeakError` em `wrap_user_message` | **decisão de implementação:** CPF/telefone/e-mail/placa *enviados pelo lead* não disparam handoff (o dataset mostra que é comportamento normal); geram um aviso único de minimização e são mascarados. H4 fica para falha do gateway |
+| H5 / H6 / H7 / H8 | exceções tipadas do `QuoteClient` | H7 mostra o `motivo` **da API** ao lead |
+| H9 | template que viola guardrail (bug ⇒ fail-closed) ou 2ª violação do LLM | 1ª violação do LLM: descarta e usa texto padrão |
+| H10 | 3 respostas inválidas/ausentes para o mesmo slot, ou 3 confirmações falhas | |
+| H11 | 12 turnos sem progresso (configurável) | silêncio do lead não é detectável num handler síncrono: precisa de timer externo |
+| H13 | 2ª ambiguidade no mesmo slot ("30 ou 40 anos") | 1ª vez: pede para escolher |
+| H14 | 2º sinal duro na sessão | `security_review` |
+| C1 | lead quer contratar | **não é exceção**: encerramento comercial (`ENDED`), pacote para finalizar com humano |
+
+**Decisão a validar:** se a mesma mensagem traz injection **e** pedido explícito de humano, vale **H1**
+(atender o pedido legítimo não cria vetor novo: o atacante já poderia inundar a fila pedindo humano).
+
+### 11.4 Limites conhecidos desta etapa
+- O LLM só redige respostas a **dúvidas livres**; slots, estados, handoff e preços são código. O
+  provedor Anthropic foi testado só com HTTP mockado (sem chave/rede reais nesta sessão).
+- Sem canal HTTP (FastAPI/WhatsApp) nem persistência real de sessão: `Agent.sessions` é memória de
+  processo e `HandoffQueue` é uma interface (há implementação em memória).
+- Lexicons em português; extração de slots simples (ex.: "tenho trinta anos" por extenso não é lido).
+- Plano é obrigatório para cotar (a API tem default `essencial`, mas o agente pergunta).

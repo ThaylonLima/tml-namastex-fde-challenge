@@ -65,9 +65,13 @@ Nunca prometa nem negue transferencia.
 
 
 # --------------------------------------------------------------------------- deteccao de injecao
-def _scan_form(text: str) -> str:
+def scan_form(text: str) -> str:
+    """Texto nao confiavel -> forma de comparacao (normalizado, sem acento, minusculo, 1 espaco)."""
     folded = fold_text(normalize_untrusted(text).text)
     return re.sub(r"\s+", " ", folded).strip()
+
+
+_scan_form = scan_form
 
 
 _OVERRIDE_RES: Final = tuple(
@@ -215,6 +219,7 @@ def injection_signals(text: str) -> frozenset[str]:
 @dataclass(frozen=True, slots=True)
 class WrappedMessage:
     block: str  # texto pronto para o prompt: <user_message>...</user_message>
+    masked_text: str  # texto mascarado SEM escape (so para codigo; nunca vai ao LLM cru)
     signals: frozenset[str]
     pii_counts: dict[str, int] = field(default_factory=dict)
     truncated: bool = False
@@ -246,13 +251,17 @@ def wrap_user_message(
     if truncated:
         text = text[:max_chars]
     block = f"<user_message>\n{_escape(text)}\n</user_message>"
-    return WrappedMessage(block, signals, masked.counts, truncated)
+    return WrappedMessage(block, text, signals, masked.counts, truncated)
 
 
-def assemble_prompt(messages: Sequence[WrappedMessage]) -> list[dict[str, str]]:
-    """Mensagens de chat: o system fica separado; o lead so entra dentro de blocos escapados."""
+def assemble_prompt(messages: Sequence[WrappedMessage], facts: str = "") -> list[dict[str, str]]:
+    """Mensagens de chat: o system fica separado; o lead so entra dentro de blocos escapados.
+
+    `facts` e contexto montado por CODIGO (nunca texto do lead), ex.: coberturas da cotacao.
+    """
+    system = SYSTEM_RULES + (f"\n\nFatos permitidos (unica fonte):\n{facts}" if facts else "")
     return [
-        {"role": "system", "content": SYSTEM_RULES},
+        {"role": "system", "content": system},
         {"role": "user", "content": "\n".join(m.block for m in messages)},
     ]
 

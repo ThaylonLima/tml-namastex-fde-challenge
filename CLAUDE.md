@@ -66,6 +66,10 @@ identificador direto em texto livre. O dataset é sintético, mas **deve ser tra
   **descartado/quarentenado** — jamais enviado "como está". Na dúvida, mascare mais.
 - **Minimização**: colete só o necessário para cotar (idade, ano do veículo, CEP, plano,
   data de início). CPF/placa não são necessários para cotar — não os solicite nem os persista.
+- **Dados de runtime × logs/LLM**: o `POST /quote` exige o CEP completo; ele é extraído do texto cru
+  antes do mascaramento e mantido **apenas** na memória volátil da sessão (`Slots.cep`). Logs,
+  persistência, pacotes de handoff e prompts recebem somente dados sanitizados (`cep[:2]`,
+  `wrap_user_message`).
 - Bronze (dado bruto) fica fora do alcance de LLM e de logs; acesso restrito e nunca commitado.
   Dados reais, `.env` e segredos **nunca** vão para o git.
 - Testes devem incluir casos de vazamento (property/regex tests) garantindo que logs e
@@ -102,6 +106,11 @@ A decisão de passar para humano é **código, não opinião do LLM**.
   pedido explícito de humano; reclamação/ameaça (Procon, jurídico, cancelamento);
   assuntos fora de escopo (sinistro, apólice existente, pagamento); entrada ininteligível
   repetida; estouro de turnos sem progresso; falha de guardrail (preço/PII).
+- **H14 (prompt injection) é em duas fases** (anti-DoS da fila humana): o 1º sinal duro NÃO chama o
+  LLM nem faz handoff — responde texto fixo reconduzindo à cotação e incrementa um contador de
+  segurança; só a reincidência (2º sinal duro na sessão) faz handoff com `security_review`.
+- O guardrail de saída bloqueia **valores monetários** fora do `Quote` (ou qualquer um sem `Quote`),
+  mas **não** números de qualificação (idade, ano do veículo, data de início, prefixo de CEP).
 - Todo handoff produz um **pacote de contexto mascarado** (motivo codificado, dados
   coletados não sensíveis, `quote_id`/status) e ao lead uma mensagem determinística
   honesta (sem prometer prazo ou preço).
