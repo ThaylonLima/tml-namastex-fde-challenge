@@ -399,7 +399,7 @@ da injection derruba os testes).
 | H5 / H6 / H7 / H8 | exceções tipadas do `QuoteClient` | H7 mostra o `motivo` **da API** ao lead |
 | H9 | template que viola guardrail (bug ⇒ fail-closed) ou 2ª violação do LLM | 1ª violação do LLM: descarta e usa texto padrão |
 | H10 | 3 respostas inválidas/ausentes para o mesmo slot, ou 3 confirmações falhas | |
-| H11 | 12 turnos sem progresso (configurável) | silêncio do lead não é detectável num handler síncrono: precisa de timer externo |
+| H11 | 12 turnos sem progresso (configurável) **ou** lead silencioso após 2 follow-ups (Etapa 4: `Agent.sweep_idle`) | silêncio não é detectável num handler: a varredura é acionada por `POST /maintenance/sweep`/CLI/timer |
 | H13 | 2ª ambiguidade no mesmo slot ("30 ou 40 anos", "trinta ou quarenta") | 1ª vez: pede para escolher |
 | H14 | 2º sinal duro na sessão | `security_review`, fila `security_review` |
 | C1 | lead quer contratar (aprovado) | **não é exceção**: encerramento comercial (`ENDED`), pacote para finalizar com humano |
@@ -416,8 +416,7 @@ Regras de segurança: valor ≥ 10 converte em qualquer contexto; 1–9 só se s
 ### 11.4 Limites conhecidos desta etapa
 - O LLM só redige respostas a **dúvidas livres**; slots, estados, handoff e preços são código. O
   provedor Anthropic foi testado só com HTTP mockado (sem chave/rede reais nesta sessão).
-- Sem canal HTTP (FastAPI/WhatsApp) nem persistência real de sessão: `Agent.sessions` é memória de
-  processo e `HandoffQueue` é uma interface (há implementação em memória).
+- *(Superado na Etapa 4: há API HTTP, persistência SQLite e varredura de inatividade — ver §12.)*
 - Léxicos em português; extração de slots simples (números por extenso só até 2099 e só nos slots críticos; dígitos de CPF/telefone por extenso continuam fora do alcance do mascarador).
 - Plano é obrigatório para cotar (a API tem default `essencial`, mas o agente pergunta).
 
@@ -432,3 +431,53 @@ Regras de segurança: valor ≥ 10 converte em qualquer contexto; 1–9 só se s
 | Guardrail sem falso positivo em slots | `test_without_a_quote_any_money_from_the_llm_is_rejected_but_slots_are_fine` |
 | Números por extenso + H13 preservado | `tests/test_slots_and_intents.py` |
 | Documentação e logs | este documento, `CLAUDE.md` (precedência da segurança), `ai-logs/01-diretrizes-e-arquitetura.jsonl` |
+
+## 12. Etapa 4 — Serviço HTTP, persistência, CLI e log oficial (implementada)
+
+### 12.1 API (`agent/app.py`, FastAPI)
+
+`GET /health[?deep=true]` (config ativa, **estado do circuit breaker**, timeouts, LLM, persistência),
+`POST /chat`, `GET /sessions/{id}` e `POST /maintenance/sweep` (os dois últimos exigem `X-Admin-Token`
+quando `ADMIN_TOKEN` está definido). Servir com `uvicorn agent.app:production_app --factory` (configura o
+log JSONL); `create_app()` não mexe em logging para testes/scripts definirem o próprio destino.
+Middleware adiciona `X-Request-ID`, registra `http_request` com o **template** da rota (nunca o `session_id`)
+e converte exceções não tratadas em `500 internal_error` genérico (só o tipo vai para o log).
+
+### 12.2 Privacidade na borda e em disco
+
+- **`session_id` pseudonimizado:** o ID externo pode ser um telefone. `pseudonymize()` = HMAC-SHA256 com
+  `SESSION_ID_SALT` → `c_<20 hex>`; logs, SQLite, pacotes de handoff e registros só conhecem a referência.
+  O agente **não** persiste o mapeamento reverso (o canal o mantém); `/health` avisa se o sal é o padrão.
+- **Persistência leve (`agent/store.py`, SQLite stdlib):** grava apenas `Session.to_record()`. Antes de gravar,
+  recusa (`PersistenceBlocked`) qualquer registro com CEP completo, CPF formatado, e-mail ou telefone.
+  O CEP completo e a cotação **não** vão a disco; `Session.from_record()` devolve CONFIRMING/QUOTING/PRESENTING
+  a QUALIFYING com aviso "Retomando o seu atendimento… pode informar o CEP de novo?". Contadores de segurança
+  (strikes), handoff e auditoria sobrevivem ao reinício; sessões terminais continuam terminais.
+- **Logs JSONL com lista branca** (`agent/logging_setup.py`): campos fora de `ALLOWED_FIELDS` são descartados,
+  strings truncadas, objetos nunca serializados. Os `extra=` do agente e do QuoteClient já usam só IDs/estados.
+
+### 12.3 Inatividade (complemento do H11)
+
+`Agent.sweep_idle()` (relógio injetável): sessão não terminal sem atividade por `FOLLOWUP_AFTER_SECONDS`
+(900 s) recebe **follow-up** (máx. 2; qualquer resposta do lead zera o contador). Após o 2º sem resposta:
+se o lead já recebeu cotação ⇒ **H11** (lead quente vai ao humano); senão a sessão é **encerrada** (`ENDED`, nada
+vai para a fila). O agente não envia nada: devolve `IdleAction`s e o canal entrega. Sessões que só existem em
+disco também são varridas.
+
+### 12.4 CLI, demo e log oficial
+
+`agent/cli.py` (`chat`, `demo [--spawn-quote]`, `sweep`, `health`) usa a mesma app em processo.
+`agent/demo.py` define 4 cenários (fluxo feliz C1, H7, H1, H14) executados **pela API HTTP**.
+`scripts/run_reference_execution.py` sobe o `quote-service` com taxas padrão e `QUOTE_SEED=1` (determina só a
+sequência do legado), roda os cenários + 20 conversas concorrentes e gera `logs/execucao_completa.jsonl`
+e `logs/EXECUCAO_COMPLETA.md`; o script **falha** se o JSONL contiver os valores fictícios (CPF/CEP completos).
+
+### 12.5 Implantação
+
+`Dockerfile` (python:3.12-slim + uv, `uv sync --frozen --no-dev`, usuário sem privilégios, healthcheck em
+`/health`) e `docker-compose.yml` com `quote-api` + `agent` (volume nomeado para o SQLite). Dependência nova:
+**uvicorn** (servidor ASGI do FastAPI já exigido pela stack).
+
+### 12.6 Limites desta etapa
+Imagem Docker não foi construída na sessão de desenvolvimento (sem daemon); SQLite de processo único; sem canal
+WhatsApp real (a borda é `POST /chat`); provedor Anthropic só validado com HTTP mockado.

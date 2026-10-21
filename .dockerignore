@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+data/
+tests/
+dataset/
+ai-logs/
+logs/
+docs/
+quote-service/
+.env
+.env.*

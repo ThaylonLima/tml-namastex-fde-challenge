@@ -32,6 +32,15 @@ PII_NOTICE: Final = (
 TERMINAL_HANDOFF: Final = (
     "O seu atendimento já foi encaminhado a um especialista. É só aguardar o contato por aqui."
 )
+FOLLOW_UP: Final = (
+    "Oi! Ainda posso te ajudar com a sua cotação de seguro auto? É só responder por aqui."
+)
+EXPIRED: Final = (
+    "Vou encerrar o atendimento por aqui por falta de resposta. Quando quiser retomar, é só chamar!"
+)
+RESTORED: Final = (
+    "Retomando o seu atendimento. Por segurança não guardo o CEP completo: pode informá-lo de novo?"
+)
 TERMINAL_ENDED: Final = "Atendimento encerrado. Se precisar de uma nova cotação, é só chamar!"
 FAQ_FALLBACK: Final = "Essa dúvida eu prefiro que um especialista confirme com precisão. Posso seguir com a sua cotação?"
 OBJECTION: Final = "Entendo! Posso cotar outro plano para você comparar. Qual plano quer ver: Essencial, Completo ou Premium?"

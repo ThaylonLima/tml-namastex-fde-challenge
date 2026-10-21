@@ -25,6 +25,7 @@ Arquitetura detalhada: [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) (fonte canô
 | Cliente HTTP | **httpx** (assíncrono, timeouts explícitos) |
 | Retry | **tenacity** |
 | Modelos e validação | **pydantic v2** (`model_validate`, `ConfigDict`, sem API v1) |
+| Servidor ASGI | **uvicorn** (somente para servir o FastAPI) |
 | Dados tabulares | **pyarrow** (somente leitura/escrita de parquet; sem pandas) |
 | Testes | **pytest** (+ `pytest-asyncio`; HTTP mockado com `respx`/`httpx.MockTransport`) |
 
@@ -70,6 +71,9 @@ identificador direto em texto livre. O dataset é sintético, mas **deve ser tra
   antes do mascaramento e mantido **apenas** na memória volátil da sessão (`Slots.cep`). Logs,
   persistência, pacotes de handoff e prompts recebem somente dados sanitizados (`cep[:2]`,
   `wrap_user_message`).
+- **Identificadores externos**: o `session_id` do canal (pode ser telefone) é pseudonimizado (HMAC) na
+  borda; logs, SQLite e pacotes de handoff só conhecem a referência. A persistência **recusa** gravar
+  CEP completo, CPF, e-mail ou telefone; o CEP completo nunca vai a disco (sessão restaurada pede de novo).
 - Bronze (dado bruto) fica fora do alcance de LLM e de logs; acesso restrito e nunca commitado.
   Dados reais, `.env` e segredos **nunca** vão para o git.
 - Testes devem incluir casos de vazamento (property/regex tests) garantindo que logs e

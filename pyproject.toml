@@ -9,6 +9,7 @@ dependencies = [
     "pyarrow>=26.0.0",
     "pydantic>=2.6",
     "tenacity>=8.2",
+    "uvicorn>=0.27",
 ]
 
 [dependency-groups]
@@ -38,3 +39,4 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # tabelas de mensagens ao lead: textos longos em uma linha sao mais legiveis que strings partidas
 "agent/handoff.py" = ["E501"]
 "agent/render.py" = ["E501"]
+"scripts/run_reference_execution.py" = ["E501"]  # strings de relatorio Markdown

@@ -10,3 +10,25 @@ services:
       QUOTE_SLOW_SECONDS: "8"
       # QUOTE_SEED: "42"   # descomente p/ falhas reproduziveis
     restart: unless-stopped
+
+  agent:
+    build: .
+    depends_on:
+      - quote-api
+    ports:
+      - "8080:8080"
+    environment:
+      QUOTE_API_URL: "http://quote-api:8000"
+      # LGPD: o session_id externo (ex.: telefone) e pseudonimizado com este sal -- troque em producao
+      SESSION_ID_SALT: "${SESSION_ID_SALT:-dev-only-salt}"
+      # protege GET /sessions/{id} e POST /maintenance/sweep (vazio = aberto, so para avaliar localmente)
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      # LLM opcional: none (padrao, 100% deterministico) | mock | anthropic (exige ANTHROPIC_API_KEY)
+      LLM_PROVIDER: "${LLM_PROVIDER:-none}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    volumes:
+      - agent-data:/srv/data
+    restart: unless-stopped
+
+volumes:
+  agent-data:

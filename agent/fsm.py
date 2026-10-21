@@ -34,6 +34,7 @@ class Event(StrEnum):
     ACCEPTED = "accepted"
     DONE = "done"
     HANDOFF = "handoff"
+    EXPIRE = "expire"  # inatividade: encerra sem handoff
 
 
 TERMINAL: Final = frozenset({State.HANDOFF, State.ENDED})
@@ -62,6 +63,7 @@ _TABLE: Final[dict[tuple[State, Event], State]] = {
 for _s in State:
     if _s not in TERMINAL:
         _TABLE[(_s, Event.HANDOFF)] = State.HANDOFF
+        _TABLE[(_s, Event.EXPIRE)] = State.ENDED
 
 
 def transition(state: State, event: Event) -> State:

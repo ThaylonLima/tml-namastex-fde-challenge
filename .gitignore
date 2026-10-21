@@ -23,3 +23,7 @@ venv/
 
 # Silver gerada localmente (reproduzivel via agent.silver); relatorio sem PII fica em docs/
 data/
+
+# logs de runtime do agente (o log OFICIAL de execucao em logs/execucao_completa.* e entregavel)
+logs/agent.jsonl
+*.sqlite

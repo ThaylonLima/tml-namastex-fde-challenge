@@ -21,7 +21,9 @@ dados sanitizados (`wrap_user_message` / `Slots.sanitized()`).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -55,6 +57,7 @@ from agent.quote_client import (
     QuoteUnavailable,
 )
 from agent.slots import Extraction, Slots, extract_slots
+from agent.store import SessionStore
 
 logger = logging.getLogger("agent.conversation")
 
@@ -65,10 +68,33 @@ MAX_GUARDRAIL_STRIKES: Final = 2
 SECURITY_STRIKES_FOR_H14: Final = 2
 HISTORY_LIMIT: Final = 5
 MAX_LLM_REPLY_CHARS: Final = 900
+FOLLOWUP_AFTER_SECONDS: Final = 900.0
+MAX_FOLLOWUPS: Final = 2
 
 
 class QuoteProvider(Protocol):
     async def quote(self, req: QuoteRequest, *, request_id: str | None = None) -> Quote: ...
+
+
+def _package_to_dict(pkg: HandoffPackage | None) -> dict[str, Any] | None:
+    if pkg is None:
+        return None
+    data = dataclasses.asdict(pkg)
+    data["reason"] = pkg.reason.value
+    return data
+
+
+def _package_from_dict(data: dict[str, Any] | None) -> HandoffPackage | None:
+    if not data:
+        return None
+    return HandoffPackage(
+        **{
+            **data,
+            "reason": Reason(data["reason"]),
+            "signals": tuple(data.get("signals", ())),
+            "recent_messages": tuple(data.get("recent_messages", ())),
+        }
+    )
 
 
 @dataclass(slots=True)
@@ -90,10 +116,14 @@ class Session:
     history: list[str] = field(default_factory=list)  # somente texto MASCARADO
     handoff: HandoffPackage | None = None
     audit: list[dict[str, Any]] = field(default_factory=list)
+    last_activity: float = 0.0
+    followups_sent: int = 0
+    pending_notice: str = ""  # aviso unico exibido no proximo turno (ex.: sessao restaurada)
 
     def to_record(self) -> dict[str, Any]:
         """Registro persistivel/logavel: nenhum campo volatil (CEP completo, nomes, texto cru)."""
         return {
+            "version": 1,
             "conversation_id": self.conversation_id,
             "state": self.state.value,
             "slots": self.slots.sanitized(),
@@ -102,9 +132,61 @@ class Session:
             "turn": self.turn,
             "security_strikes": self.security_strikes,
             "guardrail_strikes": self.guardrail_strikes,
+            "stagnant_turns": self.stagnant_turns,
+            "slot_attempts": dict(self.slot_attempts),
+            "ambiguity": dict(self.ambiguity),
+            "confirm_misses": self.confirm_misses,
+            "pii_notice_sent": self.pii_notice_sent,
+            "followups_sent": self.followups_sent,
+            "last_activity": self.last_activity,
             "history": list(self.history),
             "audit": list(self.audit),
+            "handoff": _package_to_dict(self.handoff),
         }
+
+    @classmethod
+    def from_record(cls, rec: dict[str, Any]) -> Session:
+        """Restaura uma sessao a partir do registro sanitizado.
+
+        O CEP completo e a cotacao NAO estao no registro; por isso uma sessao que estava em
+        CONFIRMING/QUOTING/PRESENTING volta a QUALIFYING e o agente pede o CEP novamente.
+        """
+        view = rec["slots"]
+        slots = Slots(
+            idade=view.get("idade"),
+            veiculo_ano=view.get("veiculo_ano"),
+            plano_id=view.get("plano_id"),
+            data_inicio=date.fromisoformat(view["data_inicio"])
+            if view.get("data_inicio")
+            else None,
+        )
+        state = State(rec["state"])
+        notice = ""
+        if state in (State.CONFIRMING, State.QUOTING, State.PRESENTING):
+            state, notice = State.QUALIFYING, render.RESTORED
+        session = cls(
+            conversation_id=rec["conversation_id"],
+            state=state,
+            slots=slots,
+            quote_status="restored_without_quote" if notice else rec.get("quote_status", "none"),
+            turn=rec.get("turn", 0),
+            security_strikes=rec.get("security_strikes", 0),
+            guardrail_strikes=rec.get("guardrail_strikes", 0),
+            stagnant_turns=rec.get("stagnant_turns", 0),
+            slot_attempts=dict(rec.get("slot_attempts", {})),
+            ambiguity=dict(rec.get("ambiguity", {})),
+            confirm_misses=rec.get("confirm_misses", 0),
+            pii_notice_sent=rec.get("pii_notice_sent", False),
+            followups_sent=rec.get("followups_sent", 0),
+            last_activity=rec.get("last_activity", 0.0),
+            history=list(rec.get("history", [])),
+            audit=list(rec.get("audit", [])),
+            handoff=_package_from_dict(rec.get("handoff")),
+            pending_notice=notice,
+        )
+        if notice:
+            session.audit.append({"turn": session.turn, "restored_from": rec["state"]})
+        return session
 
     def __repr__(self) -> str:
         return f"Session({self.conversation_id}, {self.state.value}, {self.slots!r})"
@@ -119,6 +201,15 @@ class AgentReply:
     codes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class IdleAction:
+    """Acao de varredura de inatividade, a ser entregue pelo canal (o agente nao envia sozinho)."""
+
+    conversation_id: str
+    kind: str  # follow_up | expired | handoff_h11
+    text: str
+
+
 class Agent:
     def __init__(
         self,
@@ -128,11 +219,17 @@ class Agent:
         *,
         today: Callable[[], date] = date.today,
         max_stagnant_turns: int = MAX_STAGNANT_TURNS,
+        store: SessionStore | None = None,
+        clock: Callable[[], float] = time.time,
+        followup_after: float = FOLLOWUP_AFTER_SECONDS,
     ) -> None:
         self._quotes = quote_client
         self._llm = llm or NullLLM()
         self.queue: HandoffQueue = queue or InMemoryHandoffQueue()
         self._today = today
+        self._store = store
+        self._clock = clock
+        self._followup_after = followup_after
         self._max_stagnant = max_stagnant_turns
         self.sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -142,14 +239,79 @@ class Agent:
         self, conversation_id: str, raw_text: str, *, sender_name: str | None = None
     ) -> AgentReply:
         async with self._locks.setdefault(conversation_id, asyncio.Lock()):  # 1 turno por vez
-            session = self.sessions.setdefault(conversation_id, Session(conversation_id))
+            started = time.monotonic()
+            session = self._session(conversation_id)
             if sender_name:
                 session.known_names |= parse_known_names(sender_name)
             session.turn += 1
+            session.followups_sent = 0  # o lead respondeu
+            session.last_activity = self._clock()
             before = session.state
+            notice, session.pending_notice = session.pending_notice, ""
             reply = await self._turn(session, raw_text)
-            self._log(session, before, reply)
+            if notice and not reply.handoff:
+                reply = dataclasses.replace(reply, text=f"{notice} {reply.text}")
+            self._persist(session)
+            self._log(session, before, reply, round((time.monotonic() - started) * 1000))
             return reply
+
+    def get_session(self, conversation_id: str) -> Session | None:
+        if conversation_id in self.sessions:
+            return self.sessions[conversation_id]
+        if self._store is not None and (rec := self._store.load(conversation_id)):
+            session = Session.from_record(rec)
+            self.sessions[conversation_id] = session
+            return session
+        return None
+
+    def _session(self, conversation_id: str) -> Session:
+        session = self.get_session(conversation_id)
+        if session is None:
+            session = Session(conversation_id, last_activity=self._clock())
+            self.sessions[conversation_id] = session
+        return session
+
+    def _persist(self, s: Session) -> None:
+        if self._store is not None:
+            self._store.save(s.conversation_id, s.to_record(), terminal=s.state in TERMINAL)
+
+    # ---------------------------------------------------------------- inatividade (complementa H11)
+    def sweep_idle(self) -> list[IdleAction]:
+        """Follow-ups (ate 2) e encerramento de sessoes silenciosas.
+
+        Silencio do lead nao e detectavel dentro de um handler: esta varredura (endpoint/CLI/timer)
+        faz o papel. Apos 2 follow-ups sem resposta: se o lead ja recebeu cotacao => H11 (lead
+        quente vai para o humano); senao a sessao e apenas encerrada. Nao envia nada: devolve as
+        acoes para o canal entregar.
+        """
+        now = self._clock()
+        cutoff = now - self._followup_after
+        ids = {cid for cid, s in self.sessions.items() if s.state not in TERMINAL}
+        if self._store is not None:
+            ids |= set(self._store.idle_ids(cutoff))
+        actions: list[IdleAction] = []
+        for cid in sorted(ids):
+            s = self.get_session(cid)
+            if s is None or s.state in TERMINAL or s.last_activity > cutoff:
+                continue
+            if s.followups_sent < MAX_FOLLOWUPS:
+                s.followups_sent += 1
+                s.last_activity = now
+                s.audit.append({"turn": s.turn, "idle": "follow_up", "n": s.followups_sent})
+                actions.append(IdleAction(cid, "follow_up", render.FOLLOW_UP))
+            elif s.quote_status == "ok":
+                reply = self._handoff(s, Reason.H11)
+                actions.append(IdleAction(cid, "handoff_h11", reply.text))
+            else:
+                s.state = transition(s.state, Event.EXPIRE)
+                s.audit.append({"turn": s.turn, "idle": "expired"})
+                actions.append(IdleAction(cid, "expired", render.EXPIRED))
+            self._persist(s)
+            logger.info(
+                "idle_action",
+                extra={"conversation_id": cid, "kind": actions[-1].kind, "state_to": s.state.value},
+            )
+        return actions
 
     # ---------------------------------------------------------------- turno
     async def _turn(self, s: Session, raw: str) -> AgentReply:
@@ -473,18 +635,22 @@ class Agent:
         text = lead_message(reason, motivo)
         return AgentReply(text, s.state, package, security_review, (f"HANDOFF_{reason.value}",))
 
-    def _log(self, s: Session, before: State, reply: AgentReply) -> None:
+    def _log(self, s: Session, before: State, reply: AgentReply, latency_ms: int = 0) -> None:
         """Log estruturado com lista BRANCA de campos: IDs, estados, codigos, contagens."""
         logger.info(
             "agent_turn",
             extra={
                 "conversation_id": s.conversation_id,
                 "turn": s.turn,
+                "turn_id": f"{s.conversation_id}:{s.turn}",
                 "state_from": before.value,
                 "state_to": s.state.value,
                 "codes": list(reply.codes),
                 "security_strikes": s.security_strikes,
                 "slots_filled": [k for k, v in s.slots.sanitized().items() if v is not None],
+                "quote_status": s.quote_status,
+                "quote_id": s.quote.quote_id if s.quote else None,
                 "handoff_reason": reply.handoff.reason.value if reply.handoff else None,
+                "latency_ms": latency_ms,
             },
         )
