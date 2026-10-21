@@ -1,0 +1,17 @@
+{
+  "masker_version": "0bb6d4d1ee28",
+  "bronze_rows": 26470,
+  "bronze_conversations": 2500,
+  "silver_rows": 26470,
+  "silver_conversations": 2500,
+  "quarantined_conversations": 0,
+  "masked_entities": {
+    "CEP": 2500,
+    "CPF": 2500,
+    "EMAIL": 1379,
+    "NOME": 2752,
+    "PLACA": 839,
+    "TEL": 1379
+  },
+  "quarantine_reasons": {}
+}

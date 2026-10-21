@@ -20,3 +20,6 @@ venv/
 
 # ...mas os logs de IA são entregável — ver README (Transparência de uso de IA)
 !ai-logs/**
+
+# Silver gerada localmente (reproduzivel via agent.silver); relatorio sem PII fica em docs/
+data/

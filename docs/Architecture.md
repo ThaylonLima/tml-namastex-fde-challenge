@@ -167,9 +167,11 @@ formatos soltos e variados do dataset, aplicados em ordem de especificidade:
 | E-mail | `[EMAIL]` | |
 | Telefone | `[TEL]` | formatos BR: `(11) 9xxxx-xxxx`, `+55…`, sem separadores |
 | Placa | `[PLACA]` | padrão antigo `AAA-0000` e Mercosul `AAA0A00` |
-| Nome | `[NOME]` | `sender_name` (coluna estruturada) e ocorrências no corpo, pelo dicionário de nomes da própria conversa + saudações ("Olá <nome>") |
-| CEP | `[CEP]`/prefixo | CEP completo mascarado; só os 2 primeiros dígitos (região) podem ser usados — é o que a regra de risco precisa |
-| Mídia | marcador mantido | `[documento] CNH_frente.pdf` ⇒ nome de arquivo pode conter PII ⇒ reduzido a `[documento]` |
+| Nome | `[NOME]` | (1) nomes reais extraídos de `sender_name` da conversa (+ vendedores globais), sem acento/caixa; (2) dicionário de nomes e sobrenomes comuns; (3) pistas de contexto ("meu nome é…", "Olá <Nome>", "Sra <Nome>", "<Nome>, …" no início da frase) |
+| CEP | `[CEP:NN]` | só `cep[:2]` sobrevive (região da regra de risco); CEP com rótulo ou formatado vira `[CEP:01]`; 8 dígitos soltos sem rótulo viram `[NUM]` |
+| Endereço | `[ENDERECO]` | palavra-chave (rua, av., travessa, bairro, apto…) ou "moro em/na…" + até 8 palavras, com parada em conjunções/CPF/CEP |
+| Números longos | `[NUM]` | qualquer sequência de ≥ 7 dígitos restante (RG, CNH, cartão, CEP sem rótulo). Datas, intervalos de ano e `R$` são preservados; data após "nasc…" é mascarada |
+| Mídia | marcador preservado | `[documento]`, `[imagem]`, `[audio]`/`[áudio]` ficam byte a byte; o texto após o marcador (nome do arquivo) passa pelos mesmos detectores (ex.: `CNH_[NOME].pdf`). *Decisão da Etapa 2, substitui a versão inicial que descartava o nome do arquivo.* |
 
 Campos estruturados necessários (idade, ano do veículo, plano) **não** são mascarados, mas
 são extraídos e validados em pydantic; texto livre `veiculo_texto` passa pelo mesmo gate.
@@ -289,3 +291,22 @@ partir desses eventos.
 3. FSM, handoff e guardrails.
 4. Integração com LLM e API FastAPI do canal.
 5. Execução de referência registrada, README final, `ai-logs/` completos.
+
+## 9. Etapa 2 — Camada Silver (implementada)
+
+- `agent/pii_masker.py`: `mask_text` (fail-closed → `MaskingError`), `assert_clean`/`find_leaks`
+  (segunda rede, independente e mais larga; o erro `PIILeakError` carrega só categorias, nunca o valor).
+  CPF valida os dois dígitos verificadores, mas **o DV só escolhe o rótulo** (CPF vs TEL): CPF
+  formatado ou inválido continua mascarado.
+- `agent/silver.py`: Bronze (`dataset/conversations.parquet`) → Silver (`data/silver/*.parquet`,
+  git-ignorado, reproduzível com `uv run python -m agent.silver`). `sender_name` **não** vai para a
+  Silver: vira `sender_alias` (`lead`, `vendedor_N`) e alimenta o dicionário de nomes reais da
+  conversa. Conversa inteira vai para `quarantine.jsonl` (só ID e categorias) se qualquer mensagem
+  falhar; o parquet é relido e reverificado antes de ser publicado atomicamente.
+- Relatório sem PII em `docs/silver_report.json` (contagens por entidade + hash das regras).
+- **Dependência adicionada:** `pyarrow` (leitura/escrita de parquet). Fora da stack original de
+  CLAUDE.md; mínima (sem pandas) e exigida pelo formato do dataset.
+- **Limites conhecidos (honestos):** nome próprio fora do dicionário, das pistas de contexto e de
+  `sender_name` não é detectável por regras; modelos de veículo escritos junto de dígitos
+  (`Gol2020`) são tratados como placa antiga (falso positivo aceito); sobrenome em minúsculas sem
+  pista só é pego se estiver no dicionário.

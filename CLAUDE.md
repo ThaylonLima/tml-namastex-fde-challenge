@@ -25,6 +25,7 @@ Arquitetura detalhada: [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) (fonte canô
 | Cliente HTTP | **httpx** (assíncrono, timeouts explícitos) |
 | Retry | **tenacity** |
 | Modelos e validação | **pydantic v2** (`model_validate`, `ConfigDict`, sem API v1) |
+| Dados tabulares | **pyarrow** (somente leitura/escrita de parquet; sem pandas) |
 | Testes | **pytest** (+ `pytest-asyncio`; HTTP mockado com `respx`/`httpx.MockTransport`) |
 
 Qualquer dependência fora desta lista exige justificativa registrada em `docs/` e aprovação.
