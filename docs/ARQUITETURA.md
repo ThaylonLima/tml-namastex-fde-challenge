@@ -44,8 +44,13 @@ WhatsApp ──► [Canal/Webhook FastAPI]
             WhatsApp (resposta)         └─► [Handoff] ──► fila humana (pacote mascarado)
 ```
 
-Módulos previstos (`src/autoseguro/`): `quote_client/`, `privacy/`, `agent/` (FSM, handoff,
-guardrails), `api/` (FastAPI), `observability/`, `models/` (pydantic v2).
+Módulos (pacote `agent/` na raiz): `quote_client.py` (implementado na Etapa 1), e previstos
+`privacy/`, FSM/handoff/guardrails, `api/` (FastAPI) e observabilidade.
+
+Nota de implementação (Etapa 1): idempotência por **cache** de sucessos (TTL 300 s, LRU 1024,
+chave = SHA-256 do payload canônico; falhas nunca são cacheadas; cache hit funciona com circuito
+aberto). Não há coalescência de chamadas idênticas *em voo*: duas requisições simultâneas iguais
+fazem duas chamadas ao legado.
 
 ## 3. Cliente HTTP resiliente (`QuoteClient`)
 
@@ -98,7 +103,9 @@ Configuração (padrões, todos via settings):
 - **Idempotência**: `/quote` é cálculo puro, sem efeito colateral ⇒ retry seguro. Mesmo
   assim propagamos `X-Request-ID` estável entre tentativas para correlação.
 
-Pior caso (3 tentativas): 10 s + ≤4 s + 10 s + ≤4 s ≤ 28 s ⇒ cabe no deadline por construção.
+Pior caso (3 tentativas): 10 s + ≤4 s + 10 s + ≤4 s + 10 s = 38 s > 28 s. O deadline é imposto por
+construção: o backoff é limitado ao que resta e o timeout da tentativa é `min(10 s, restante)`; assim a
+última tentativa é truncada e a operação nunca passa de 28 s. (Correção da versão inicial deste doc.)
 
 ### 3.4 Circuit breaker
 
