@@ -251,6 +251,7 @@ para baixo (primeira regra que casa vence).
 | H11 | Sem progresso: > N turnos (ex.: 12) sem avançar de estado ou lead silencioso após 2 follow-ups | contadores | Baixa | Encaminha/encerra com cortesia |
 | H12 | Negociação fora da política (pede desconto, exceção de regra, cobertura inexistente) | intenção | Média | Humano decide; bot não promete |
 | H13 | Baixa confiança de NLU em slot crítico mesmo após reconfirmação | limiar de confiança | Média | Confirma com humano |
+| H14 | **(proposta da auditoria, Etapa 2.5)** Tentativa de prompt injection: sinal duro em `injection_signals` (override de instruções, exfiltração do system prompt, troca de papel, quebra de delimitador, manipulação de preço, burla de handoff, payload codificado) | `agent/prompt_safety.py` | Alta | Encaminha ao humano sem executar o pedido |
 
 Contrato do pacote de handoff (sempre mascarado): `conversation_id`, `handoff_reason`
 (código H1…H13), `from_state`, slots coletados não sensíveis, `quote_id`/status ou
@@ -310,3 +311,33 @@ partir desses eventos.
   `sender_name` não é detectável por regras; modelos de veículo escritos junto de dígitos
   (`Gol2020`) são tratados como placa antiga (falso positivo aceito); sobrenome em minúsculas sem
   pista só é pego se estiver no dicionário.
+
+## 10. Auditoria de segurança — prompt injection e Unicode hostil (Etapa 2.5)
+
+**Achado principal:** antes desta auditoria **não existia camada de prompt** (nenhum código montava
+prompts para LLM), logo não havia delimitação do texto do lead. Foi criada `agent/prompt_safety.py`.
+
+| Camada | Onde | O que faz |
+|---|---|---|
+| Normalização | `pii_masker.normalize_untrusted` | NFKC; decodifica entidades HTML e percent-encoding; remove Cf (zero-width, bidi, tag chars), Mn/Me (marcas combinantes, seletores de variação) e fillers Hangul/braille; mapeia homóglifos cirílicos/gregos para latim |
+| Confinamento | `wrap_user_message` | normaliza → mascara (fail-closed) → `assert_clean` → escapa `& < >` → `<user_message>…</user_message>`. Sem `<`/`>` o lead não fecha o bloco nem forja `<system>` |
+| Detecção | `injection_signals` | regex sobre texto dobrado (minúsculas, sem acento, homóglifos resolvidos) + forma "colada" (`i.g.n.o.r.e`) + variantes rot13/invertido/base64 |
+| Saída (preço) | `find_unauthorized_amounts` | só valores do `Quote` passam; sem `Quote` nenhum valor passa; pega `R$`, "reais", por extenso, "grátis", "desconto" |
+| Saída (system prompt) | `leaks_system_prompt` | canário aleatório por processo + shingles de 6 palavras do prompt |
+| Handoff | `handoff_reasons(text)` | decide só pelo texto do lead (assinatura sem parâmetro de saída do LLM): H1 (pedido de humano, imune a ofuscação, "não quero humano" não conta) e H14 |
+
+**Vulnerabilidades reais encontradas e corrigidas no masker:** filler Hangul e braille em branco
+entre dígitos; homóglifos cirílicos em placa e nome; e-mail em entidade HTML e em percent-encoding;
+marcas combinantes/seletores de variação deixando dígitos soltos (`5́2́[NUM]`).
+
+**Limites conhecidos (não resolvidos):**
+- Dígitos por extenso ("cinco dois nove…") e leetspeak em dígitos não são detectados como PII.
+- Injeção semântica/parafraseada sem as palavras-chave (outros idiomas, metáforas) escapa das
+  regex; a defesa nesse caso é estrutural (confinamento + guardrails de saída + handoff por código),
+  não a detecção.
+- Ataque distribuído em várias mensagens (cada uma inofensiva) não é correlacionado.
+- Conteúdo de mídia (OCR de imagem, transcrição de áudio) ainda não existe, mas **deve** passar por
+  `wrap_user_message` quando existir.
+- O system prompt é consultivo; a segurança não depende dele. O canário pega vazamento literal ou
+  quase literal, não resumo semântico.
+- Falsos positivos de H14 existem em teoria; medido contra todas as mensagens de lead do dataset: 0.

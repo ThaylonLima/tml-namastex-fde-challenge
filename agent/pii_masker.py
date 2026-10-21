@@ -19,8 +19,10 @@ Garantias:
 
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
+import urllib.parse
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -114,11 +116,112 @@ def _fold(text: str) -> str:
     return "".join(out)
 
 
+# Letras "invisiveis" (categoria Lo/So, nao Cf) usadas como separador oculto entre digitos/letras.
+_INVISIBLE_LETTERS: Final = frozenset("\u115f\u1160\u3164\uffa0\u2800\u17b4\u17b5")
+
+# Homoglifos Cirilico/Grego -> Latim. Sem isso "J\u043eao" (o cirilico) ou "\u0410\u0412\u04211D23"
+# furam o dicionario de nomes e o detector de placa.
+_EMOJI_JOINERS: Final = frozenset("\u200d\ufe0e\ufe0f")
+
+_CONFUSABLE_PAIRS: Final = (
+    # Cirilico maiusculo
+    ("\u0410", "A"),
+    ("\u0412", "B"),
+    ("\u0415", "E"),
+    ("\u041a", "K"),
+    ("\u041c", "M"),
+    ("\u041d", "H"),
+    ("\u041e", "O"),
+    ("\u0420", "P"),
+    ("\u0421", "C"),
+    ("\u0422", "T"),
+    ("\u0423", "Y"),
+    ("\u0425", "X"),
+    # Cirilico minusculo
+    ("\u0430", "a"),
+    ("\u0435", "e"),
+    ("\u043e", "o"),
+    ("\u0440", "p"),
+    ("\u0441", "c"),
+    ("\u0443", "y"),
+    ("\u0445", "x"),
+    ("\u043a", "k"),
+    ("\u0456", "i"),
+    ("\u043c", "m"),
+    ("\u043d", "h"),
+    ("\u0442", "t"),
+    ("\u0432", "b"),
+    ("\u0455", "s"),
+    ("\u0458", "j"),
+    ("\u0501", "d"),
+    # Grego maiusculo
+    ("\u0391", "A"),
+    ("\u0392", "B"),
+    ("\u0395", "E"),
+    ("\u0396", "Z"),
+    ("\u0397", "H"),
+    ("\u0399", "I"),
+    ("\u039a", "K"),
+    ("\u039c", "M"),
+    ("\u039d", "N"),
+    ("\u039f", "O"),
+    ("\u03a1", "P"),
+    ("\u03a4", "T"),
+    ("\u03a5", "Y"),
+    ("\u03a7", "X"),
+    # Grego minusculo e i sem ponto
+    ("\u03bf", "o"),
+    ("\u03bd", "v"),
+    ("\u03b1", "a"),
+    ("\u03c1", "p"),
+    ("\u03b9", "i"),
+    ("\u03ba", "k"),
+    ("\u03c4", "t"),
+    ("\u03c5", "u"),
+    ("\u03c7", "x"),
+    ("\u0131", "i"),
+)
+_CONFUSABLES: Final = {ord(src): dst for src, dst in _CONFUSABLE_PAIRS}
+_ENCODED_PERCENT_RE: Final = re.compile(r"(?:%[0-9A-Fa-f]{2}){1}")
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedText:
+    text: str
+    hidden_removed: int  # caracteres invisiveis/combinantes removidos (sinal de ofuscacao)
+    decoded: bool  # houve decodificacao de entidade HTML / percent-encoding
+
+
+def normalize_untrusted(text: str) -> NormalizedText:
+    """Normaliza texto NAO CONFIAVEL antes de qualquer deteccao.
+
+    NFKC (full-width, ligaturas, espacos exoticos), decodifica entidades HTML e percent-encoding
+    (` &#64;`, `%40`), remove caracteres invisiveis (Cf: zero-width, bidi, tag chars; Mn/Me: marcas
+    combinantes e seletores de variacao; fillers Hangul/braille) e mapeia homoglifos para Latim.
+    Em pt-BR toda letra acentuada tem forma pre-composta, entao as marcas que sobram apos o NFKC
+    sao ofuscacao, nao ortografia.
+    """
+    out = unicodedata.normalize("NFKC", text)
+    decoded = False
+    unescaped = html.unescape(out)
+    if len(_ENCODED_PERCENT_RE.findall(unescaped)) >= 1:
+        unescaped = urllib.parse.unquote(unescaped)
+    if unescaped != out:
+        decoded = True
+        out = unicodedata.normalize("NFKC", unescaped)
+    kept: list[str] = []
+    removed = 0
+    for ch in out:
+        if unicodedata.category(ch) in {"Cf", "Mn", "Me"} or ch in _INVISIBLE_LETTERS:
+            if ch not in _EMOJI_JOINERS:  # emoji legitimo nao conta como ofuscacao
+                removed += 1
+            continue
+        kept.append(ch)
+    return NormalizedText("".join(kept).translate(_CONFUSABLES), removed, decoded)
+
+
 def _normalize(text: str) -> str:
-    """NFKC (digitos/letras full-width, ligaturas) e remocao de caracteres de formato invisiveis
-    (zero-width etc.) que seriam usados para furar os detectores."""
-    text = unicodedata.normalize("NFKC", text)
-    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return normalize_untrusted(text).text
 
 
 def cpf_valid(digits: str) -> bool:
@@ -149,6 +252,11 @@ def _name_regex(known: frozenset[str]) -> re.Pattern[str]:
     names = {_fold(n) for n in known} | set(_FIRST_NAMES) | set(_SURNAMES)
     alternation = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
     return re.compile(rf"(?<![a-z0-9])(?:{alternation})(?![a-z0-9])")
+
+
+def fold_text(text: str) -> str:
+    """Versao publica de `_fold` (minusculas, sem acento, mesmo comprimento)."""
+    return _fold(text)
 
 
 def _token_spans(text: str) -> list[tuple[int, int]]:
