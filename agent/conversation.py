@@ -4,9 +4,10 @@ Ordem de avaliacao a cada mensagem (a primeira regra que casa vence), tudo em CO
 
   0. sessao terminal (HANDOFF/ENDED)  -> resposta fixa, sem LLM, sem processar
   1. gateway de privacidade           -> falha => H4 (nunca segue com texto cru)
-  2. H1 humano / H2 reclamacao / H3 fora de escopo
-  3. injection: 1o sinal duro => resposta padrao + contador (SEM LLM, SEM handoff, SEM slots);
+  2. injection (precedencia ESTRITA, inclusive sobre pedido de humano):
+                1o sinal duro => resposta padrao + contador (SEM LLM, SEM handoff, SEM slots);
                 2o sinal duro => H14 (security_review)
+  3. H1 humano / H2 reclamacao / H3 fora de escopo
   4. H12 negociacao fora da politica
   5. slots/estado (H10 slot invalido repetido, H13 ambiguidade, H11 sem progresso)
   6. QuoteClient (H5 indisponivel, H6 circuito aberto, H7 recusa 422, H8 payload invalido)
@@ -166,15 +167,9 @@ class Agent:
         s.history = (s.history + [wrapped.masked_text])[-HISTORY_LIMIT:]
         hard = wrapped.signals & HARD_SIGNALS
 
-        # 2. necessidades legitimas de atendimento humano (decididas por codigo, nao pelo LLM)
-        if explicit_human_request(raw):
-            return self._handoff(s, Reason.H1, signals=hard)
-        if intents.complaint(raw):
-            return self._handoff(s, Reason.H2, signals=hard)
-        if intents.out_of_scope(raw):
-            return self._handoff(s, Reason.H3, signals=hard)
-
-        # 3. prompt injection: 1a vez recondiciona, 2a vez H14 (anti-DoS da fila humana)
+        # 2. SEGURANCA TEM PRECEDENCIA ESTRITA sobre qualquer intencao (inclusive pedido de humano):
+        #    mensagem com sinal duro de injection nunca vira H1/H2/H3 (nao envenena a fila comum).
+        #    1a vez: reconduz sem LLM e sem handoff; 2a vez: H14 com security_review.
         if hard:
             s.security_strikes += 1
             if s.security_strikes >= SECURITY_STRIKES_FOR_H14:
@@ -182,6 +177,15 @@ class Agent:
             return self._finalize_template(
                 s, f"{render.SECURITY_FIRST} {self._reprompt(s)}", codes=("SECURITY_STRIKE_1",)
             )
+
+        # 3. necessidades legitimas de atendimento humano (decididas por codigo, nao pelo LLM);
+        #    um pedido limpo no turno seguinte dispara H1 normalmente
+        if explicit_human_request(raw):
+            return self._handoff(s, Reason.H1)
+        if intents.complaint(raw):
+            return self._handoff(s, Reason.H2)
+        if intents.out_of_scope(raw):
+            return self._handoff(s, Reason.H3)
 
         # 4. negociacao fora da politica
         if intents.negotiation(raw):

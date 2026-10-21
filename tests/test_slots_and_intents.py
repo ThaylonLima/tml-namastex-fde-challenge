@@ -170,3 +170,124 @@ def test_fsm_every_non_terminal_state_can_handoff_and_terminals_cannot_move() ->
 def test_fsm_rejects_illegal_jumps(state: State, event: Event) -> None:
     with pytest.raises(InvalidTransition):
         transition(state, event)
+
+
+# --------------------------------------------------------------------------- numeros por extenso
+@pytest.mark.parametrize(
+    ("raw", "expecting", "expected"),
+    [
+        ("tenho trinta e cinco anos", None, {"idade": 35}),
+        ("Tenho vinte e um anos", None, {"idade": 21}),
+        ("vinte", "idade", {"idade": 20}),
+        ("quarenta", "idade", {"idade": 40}),
+        ("trinta e cinco", "idade", {"idade": 35}),
+        ("tenho dezoito anos", None, {"idade": 18}),
+        ("tenho nove anos", None, {"idade": 9}),
+        ("plano um", None, {"plano_id": "essencial"}),
+        ("plano dois", None, {"plano_id": "completo"}),
+        ("quero o plano três", None, {"plano_id": "premium"}),
+        ("plano 3", None, {"plano_id": "premium"}),
+        ("dois", "plano_id", {"plano_id": "completo"}),
+        ("3", "plano_id", {"plano_id": "premium"}),
+        ("um gol dois mil e vinte e dois", None, {"veiculo_ano": 2022}),
+        ("mil novecentos e noventa e oito", "veiculo_ano", {"veiculo_ano": 1998}),
+        ("dois mil e dezoito", "veiculo_ano", {"veiculo_ano": 2018}),
+        (
+            "plano dois, tenho trinta anos, carro dois mil e vinte",
+            None,
+            {"plano_id": "completo", "idade": 30, "veiculo_ano": 2020},
+        ),
+    ],
+)
+def test_spelled_out_numbers_fill_the_critical_slots(
+    raw: str, expecting: str | None, expected: dict[str, object]
+) -> None:
+    r = ex(raw, expecting=expecting)
+    assert r.values == expected, raw
+    assert not r.invalid and not r.ambiguous
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "tenho um carro",  # "um" solto nunca vira idade 1
+        "quero um seguro",
+        "preciso de dois orçamentos",
+        "meu carro tem cinco anos",  # idade do veiculo, nao do lead
+        "em tres parcelas",
+        "duzentos e cinquenta reais",
+    ],
+)
+def test_spelled_numbers_without_slot_context_are_not_slots(raw: str) -> None:
+    assert ex(raw).values == {}, raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expecting", "slot"),
+    [
+        ("tenho trinta ou quarenta anos", None, "idade"),
+        ("trinta e quarenta", "idade", "idade"),  # nao se funde em "setenta"
+        ("plano um ou plano dois", None, "plano_id"),
+        ("essencial ou plano três", None, "plano_id"),
+        ("um gol dois mil e dez ou dois mil e doze", None, "veiculo_ano"),
+    ],
+)
+def test_ambiguity_is_preserved_with_spelled_out_numbers(
+    raw: str, expecting: str | None, slot: str
+) -> None:
+    r = ex(raw, expecting=expecting)
+    assert slot in r.ambiguous, raw
+    assert slot not in r.values
+
+
+def test_the_plan_numeral_is_not_reused_as_age_or_year() -> None:
+    assert ex("plano dois").values == {"plano_id": "completo"}
+    assert ex("plano 2").values == {"plano_id": "completo"}
+    assert "idade" not in ex("plano 3").values
+
+
+def test_words_to_numbers_grammar() -> None:
+    from agent.numbers_pt import words_to_numbers as w
+
+    assert w("trinta e cinco anos") == "35 anos"
+    assert w("cento e vinte e tres") == "123"
+    assert w("duzentos e cinquenta") == "250"
+    assert w("mil") == "1000"
+    assert w("dois mil") == "2000"
+    assert w("dois mil vinte e dois") == "2022"
+    assert w("um dois tres") == "um dois tres"  # unidades soltas nao viram digitos
+    assert w("trinta e quarenta") == "30 e 40"
+    assert w("nove anos") == "9 anos" and w("nove carros") == "nove carros"
+    assert w("dez") == "10" and w("onze") == "11"
+
+
+async def test_conversation_with_spelled_out_answers_reaches_the_quote(
+    api,
+    quote_client,
+    queue,  # type: ignore[no-untyped-def]
+) -> None:
+    from tests.conftest import make_agent, ok_response
+
+    route = api.post("/quote").mock(return_value=ok_response())
+    agent = make_agent(quote_client, queue)
+    for text in [
+        "Oi",
+        "trinta e cinco",
+        "dois mil e vinte e dois",
+        "cep 01310-100",
+        "plano dois",
+        "sim",
+    ]:
+        reply = await agent.handle_message("c1", text)
+    assert reply.state.value == "presenting" and route.call_count == 1
+    import json
+
+    assert json.loads(route.calls.last.request.content) == {
+        "plano_id": "completo", "idade": 35, "veiculo_ano": 2022, "cep": "01310-100",
+    }  # fmt: skip
+
+
+def test_a_plan_numeral_next_to_the_word_anos_is_not_taken_as_the_lead_age() -> None:
+    r = ex("plano 3 anos de cobertura")
+    assert r.values == {"plano_id": "premium"}
+    assert "idade" not in r.values

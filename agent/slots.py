@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Final
 
+from agent.numbers_pt import words_to_numbers
 from agent.pii_masker import normalize_untrusted
 from agent.prompt_safety import scan_form
 from agent.quote_client import QuoteRequest
@@ -81,6 +82,8 @@ _AGE_PATTERNS = (
     re.compile(r"\bidade\b\W{0,8}(?:e\s+)?(\d{1,3})\b"),
     re.compile(r"(?<![\d./-])(\d{1,3})\s*anos\b"),
 )
+_PLAN_ORDINAL: Final = {"um": 1, "1": 1, "dois": 2, "2": 2, "tres": 3, "3": 3}
+_PLAN_NUMBER = re.compile(r"\bplano\s+(um|dois|tres|1|2|3)\b")
 _AGE_LIST = re.compile(r"(?<![\d./-])(\d{1,3})\s+(?:ou|e)\s+(\d{1,3})\s*anos\b")
 _VEHICLE_CONTEXT = re.compile(r"(carro|veiculo|moto|automovel|ele|ela|tem|modelo)\W+(?:\w+\W+)?$")
 
@@ -142,6 +145,17 @@ def extract_slots(raw: str, masked: str, *, expecting: str | None, today: date) 
         invalid.add("data_inicio")
 
     plans = {p for p in PLANS if re.search(rf"\b{p}\b", rest)}
+    for m in _PLAN_NUMBER.finditer(
+        rest
+    ):  # "plano 2" / "plano dois" (1=essencial, 2=completo, 3=premium)
+        plans.add(PLANS[_PLAN_ORDINAL[m.group(1)] - 1])
+    rest = _PLAN_NUMBER.sub(" ", rest)  # o numeral do plano nao pode virar idade/ano
+    rest = words_to_numbers(rest)
+    bare_plan = (
+        re.fullmatch(r"\s*(um|dois|tres|1|2|3)\s*", folded) if expecting == "plano_id" else None
+    )
+    if bare_plan:
+        plans.add(PLANS[_PLAN_ORDINAL[bare_plan.group(1)] - 1])
     if len(plans) == 1:
         values["plano_id"] = next(iter(plans))
     elif len(plans) > 1:
@@ -159,6 +173,12 @@ def extract_slots(raw: str, masked: str, *, expecting: str | None, today: date) 
             ages.add(int(m.group(1)))
     if not ages and expecting == "idade" and re.fullmatch(r"\s*\d{1,3}\s*", rest):
         ages.add(int(rest))
+    elif (
+        not ages
+        and expecting == "idade"
+        and re.fullmatch(r"[\d\s,]*(?:\s(?:e|ou)\s)[\d\s,]*", rest)
+    ):
+        ages.update(int(n) for n in re.findall(r"\d{1,3}", rest))  # "30 ou 40": ambiguo
     if len(ages) == 1:
         age = next(iter(ages))
         if 0 <= age <= MAX_AGE:

@@ -377,30 +377,58 @@ marcas combinantes/seletores de variação deixando dígitos soltos (`5́2́[NUM
 
 ### 11.3 Ordem de avaliação por mensagem (primeira regra que casa vence)
 
-sessão terminal ⇒ resposta fixa → gateway de privacidade (**H4**) → **H1** humano → **H2** reclamação →
-**H3** fora de escopo → injection (1º: redireciona; 2º: **H14**) → **H12** negociação → slots/estado
-(**H10**, **H13**, **H11**) → QuoteClient (**H5**, **H6**, **H7**, **H8**) → guardrails de saída (**H9**).
+sessão terminal ⇒ resposta fixa → gateway de privacidade (**H4**) → **injection com precedência
+estrita** (1º sinal duro: redireciona; 2º: **H14**) → **H1** humano → **H2** reclamação → **H3** fora de
+escopo → **H12** negociação → slots/estado (**H10**, **H13**, **H11**) → QuoteClient (**H5**, **H6**,
+**H7**, **H8**) → guardrails de saída (**H9**).
+
+**Precedência da segurança (decisão do arquiteto, ressalva anterior revogada):** se a mesma mensagem
+traz sinal duro de injection **e** pedido de humano (ou reclamação/fora de escopo), vale a injection:
+no 1º strike nada vira H1/H2/H3, não há handoff, o LLM não é chamado, os slots do texto são
+descartados e `security_strikes` sobe (a fila comercial não é envenenada e nenhum ticket sai sem a
+flag `security_review`). No turno seguinte, um pedido de humano **sem ataque** dispara H1 normalmente;
+insistir no ataque (com ou sem pedido de humano) cai no 2º strike ⇒ H14. Coberto por testes unitários,
+e2e (inundação de 15 sessões × 5 ataques ⇒ 15 tickets H14, nenhum H1) e por mutação (avaliar H1 antes
+da injection derruba os testes).
 
 | Gatilho | Onde é decidido | Observação |
 |---|---|---|
-| H1 | `explicit_human_request` | imune a ofuscação Unicode; "não quero humano" não conta |
-| H2 / H3 / H12 | `intents.complaint / out_of_scope / negotiation` | léxicos; 0 disparos nas mensagens de lead do dataset |
-| H4 | `MaskingError` / `PIILeakError` em `wrap_user_message` | **decisão de implementação:** CPF/telefone/e-mail/placa *enviados pelo lead* não disparam handoff (o dataset mostra que é comportamento normal); geram um aviso único de minimização e são mascarados. H4 fica para falha do gateway |
+| H1 | `explicit_human_request` | imune a ofuscação Unicode; "não quero humano" não conta; **só em mensagens sem sinal duro** |
+| H2 / H3 / H12 | `intents.complaint / out_of_scope / negotiation` | léxicos; 0 disparos nas mensagens de lead do dataset; H2/H3 também ficam atrás da injection |
+| H4 | `MaskingError` / `PIILeakError` em `wrap_user_message` | CPF/telefone/e-mail/placa *enviados pelo lead* **não** disparam handoff (aprovado): geram um aviso único de minimização e são mascarados. H4 = falha do gateway |
 | H5 / H6 / H7 / H8 | exceções tipadas do `QuoteClient` | H7 mostra o `motivo` **da API** ao lead |
 | H9 | template que viola guardrail (bug ⇒ fail-closed) ou 2ª violação do LLM | 1ª violação do LLM: descarta e usa texto padrão |
 | H10 | 3 respostas inválidas/ausentes para o mesmo slot, ou 3 confirmações falhas | |
 | H11 | 12 turnos sem progresso (configurável) | silêncio do lead não é detectável num handler síncrono: precisa de timer externo |
-| H13 | 2ª ambiguidade no mesmo slot ("30 ou 40 anos") | 1ª vez: pede para escolher |
-| H14 | 2º sinal duro na sessão | `security_review` |
-| C1 | lead quer contratar | **não é exceção**: encerramento comercial (`ENDED`), pacote para finalizar com humano |
+| H13 | 2ª ambiguidade no mesmo slot ("30 ou 40 anos", "trinta ou quarenta") | 1ª vez: pede para escolher |
+| H14 | 2º sinal duro na sessão | `security_review`, fila `security_review` |
+| C1 | lead quer contratar (aprovado) | **não é exceção**: encerramento comercial (`ENDED`), pacote para finalizar com humano |
 
-**Decisão a validar:** se a mesma mensagem traz injection **e** pedido explícito de humano, vale **H1**
-(atender o pedido legítimo não cria vetor novo: o atacante já poderia inundar a fila pedindo humano).
+### 11.3.1 Números por extenso (`agent/numbers_pt.py`)
+
+Gramática determinística 0–2099 sobre o texto dobrado: "vinte", "trinta e cinco anos", "cento e vinte",
+"dois mil e vinte e dois", "mil novecentos e noventa e oito"; planos por ordinal ("plano um/dois/três",
+"plano 1/2/3", ou só "dois" quando o agente pergunta o plano; 1=Essencial, 2=Completo, 3=Premium).
+Regras de segurança: valor ≥ 10 converte em qualquer contexto; 1–9 só se seguido de "ano(s)"
+("tenho um carro" **não** vira idade 1); sequências inválidas não se fundem ("trinta e quarenta" ⇒
+30 e 40 ⇒ ambiguidade ⇒ H13); o numeral do plano não é reaproveitado como idade/ano.
 
 ### 11.4 Limites conhecidos desta etapa
 - O LLM só redige respostas a **dúvidas livres**; slots, estados, handoff e preços são código. O
   provedor Anthropic foi testado só com HTTP mockado (sem chave/rede reais nesta sessão).
 - Sem canal HTTP (FastAPI/WhatsApp) nem persistência real de sessão: `Agent.sessions` é memória de
   processo e `HandoffQueue` é uma interface (há implementação em memória).
-- Lexicons em português; extração de slots simples (ex.: "tenho trinta anos" por extenso não é lido).
+- Léxicos em português; extração de slots simples (números por extenso só até 2099 e só nos slots críticos; dígitos de CPF/telefone por extenso continuam fora do alcance do mascarador).
 - Plano é obrigatório para cotar (a API tem default `essencial`, mas o agente pergunta).
+
+### 11.5 Checklist de fechamento da Etapa 3
+
+| Item | Evidência |
+|---|---|
+| Módulos do agente | `quote_client`, `pii_masker`, `silver`, `prompt_safety`, `fsm`, `slots`, `numbers_pt`, `intents`, `render`, `handoff`, `llm`, `conversation` |
+| H1–H14 + C1 alcançáveis | `tests/test_handoff_matrix.py::test_each_matrix_reason_is_reachable_in_the_real_agent` (parametrizado nos 15 motivos; falha se um motivo novo não tiver cenário) |
+| H14 em duas fases + precedência sobre H1/H2/H3 | `tests/test_e2e_agent.py` (injection × humano, persistência do ataque, inundação) + mutação |
+| CEP completo só em memória volátil | `Slots.cep` é o único uso de `.cep` (teste estático varre `agent/`); `test_full_cep_reaches_the_api_but_never_logs_prompts_or_packages` cobre logs, `to_record`, repr, pacote, histórico e prompts; replay de 150 conversas reais sem vazamento |
+| Guardrail sem falso positivo em slots | `test_without_a_quote_any_money_from_the_llm_is_rejected_but_slots_are_fine` |
+| Números por extenso + H13 preservado | `tests/test_slots_and_intents.py` |
+| Documentação e logs | este documento, `CLAUDE.md` (precedência da segurança), `ai-logs/01-diretrizes-e-arquitetura.jsonl` |

@@ -19,7 +19,7 @@ QUESTIONS: Final = {
     "idade": "Qual a sua idade?",
     "veiculo_ano": "Qual o ano do veículo?",
     "cep": "Qual o CEP de onde o carro dorme?",
-    "plano_id": "Qual plano você prefere: Essencial, Completo ou Premium?",
+    "plano_id": "Qual plano você prefere: Essencial (1), Completo (2) ou Premium (3)?",
 }
 ASK_CONFIRM: Final = "Responda *sim* para eu cotar, ou me diga o que deseja corrigir."
 WAIT_NOTICE: Final = "Estou consultando os valores, um instante!"

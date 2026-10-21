@@ -109,6 +109,9 @@ A decisão de passar para humano é **código, não opinião do LLM**.
 - **H14 (prompt injection) é em duas fases** (anti-DoS da fila humana): o 1º sinal duro NÃO chama o
   LLM nem faz handoff — responde texto fixo reconduzindo à cotação e incrementa um contador de
   segurança; só a reincidência (2º sinal duro na sessão) faz handoff com `security_review`.
+- **Segurança tem precedência estrita sobre intenção comercial**: mensagem com sinal duro de injection
+  nunca vira H1/H2/H3 (1º strike só reconduz e conta; 2º strike = H14). Um pedido de humano sem
+  ataque, em turno posterior, dispara H1 normalmente.
 - O guardrail de saída bloqueia **valores monetários** fora do `Quote` (ou qualquer um sem `Quote`),
   mas **não** números de qualificação (idade, ano do veículo, data de início, prefixo de CEP).
 - Todo handoff produz um **pacote de contexto mascarado** (motivo codificado, dados

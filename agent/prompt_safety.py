@@ -375,7 +375,10 @@ def explicit_human_request(text: str) -> bool:
 
 
 def handoff_reasons(text: str) -> list[str]:
-    """Gatilhos deterministicos sobre o texto do lead. O veredito do LLM nunca entra aqui."""
+    """Gatilhos deterministicos sobre o texto do lead. O veredito do LLM nunca entra aqui.
+
+    Lista TODOS os sinais encontrados; a precedencia (H14 domina H1) e aplicada pelo `Agent`.
+    """
     reasons: list[str] = []
     if explicit_human_request(text):
         reasons.append("H1")
