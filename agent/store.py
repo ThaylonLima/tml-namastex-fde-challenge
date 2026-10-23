@@ -43,6 +43,7 @@ class SessionStore(Protocol):
     def save(self, conversation_id: str, record: dict[str, Any], *, terminal: bool) -> None: ...
     def load(self, conversation_id: str) -> dict[str, Any] | None: ...
     def idle_ids(self, before: float) -> list[str]: ...
+    def purge_terminal(self, older_than: float) -> int: ...
     def close(self) -> None: ...
 
 
@@ -93,6 +94,15 @@ class SqliteSessionStore:
                 (before,),
             ).fetchall()
         return [r[0] for r in rows]
+
+    def purge_terminal(self, older_than: float) -> int:
+        """Retencao: apaga sessoes TERMINAIS sem atualizacao desde `older_than`. Devolve quantas."""
+        with self._lock:
+            cur = self._db.execute(
+                "DELETE FROM sessions WHERE terminal = 1 AND updated_at < ?", (older_than,)
+            )
+            self._db.commit()
+            return cur.rowcount
 
     def close(self) -> None:
         with self._lock:

@@ -213,6 +213,7 @@ def build_resources(
         store=store,
         clock=clock,
         followup_after=settings.followup_after_seconds,
+        policy=settings.session_policy(),
     )
     return Resources(settings, client, adapter, store, agent, owns)
 
@@ -353,7 +354,7 @@ def create_app(
     async def get_session(
         session_id: Annotated[str, Path(pattern=SESSION_ID_PATTERN)],
     ) -> dict[str, Any]:
-        session = res.agent.get_session(ref(session_id))
+        session = res.agent.peek_session(ref(session_id))
         if session is None:
             raise HTTPException(status_code=404, detail="sessao nao encontrada")
         return {"session_id": session_id, "record": session.to_record()}
