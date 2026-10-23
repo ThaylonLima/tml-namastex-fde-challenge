@@ -2,7 +2,7 @@
 
     uv run python -m agent.cli chat                  conversa interativa no terminal
     uv run python -m agent.cli demo [--spawn-quote]  roda os cenarios automatizados
-    uv run python -m agent.cli sweep                 follow-ups / encerramento de sessoes inativas
+    uv run python -m agent.cli sweep [--url URL]     follow-ups / encerramento de sessoes inativas
     uv run python -m agent.cli health                configuracao ativa e estado do circuit breaker
 
 O CLI usa a mesma app FastAPI (em processo) e fala com o quote-service real via QUOTE_API_URL.
@@ -129,7 +129,20 @@ async def cmd_demo(settings: Settings, only: str | None) -> int:
     return 0
 
 
+async def cmd_sweep_remote(settings: Settings, url: str) -> int:
+    """Sweep contra o servidor em execucao (o unico modo correto em producao)."""
+    async with httpx.AsyncClient(base_url=url, timeout=httpx.Timeout(30.0, connect=5.0)) as client:
+        r = await client.post("/maintenance/sweep", headers={"X-Admin-Token": settings.admin_token})
+    out(json.dumps(r.json(), ensure_ascii=False, indent=2))
+    return 0 if r.is_success else 1
+
+
 async def cmd_sweep(settings: Settings) -> int:
+    out(
+        "AVISO: sweep EM PROCESSO (sem --url): nao fala com o servidor em execucao, restaura "
+        "sessoes do SQLite sem a cotacao e disputa a escrita do banco. Em producao use --url.",
+        sys.stderr,
+    )
     app, client = _client(settings)
     try:
         r = await client.post("/maintenance/sweep", headers={"X-Admin-Token": settings.admin_token})
@@ -159,7 +172,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     demo = sub.add_parser("demo", help="cenários automatizados")
     demo.add_argument("--only", help="filtra cenários pelo trecho do nome (ex.: h14)")
     demo.add_argument("--spawn-quote", action="store_true", help="sobe o quote-service local")
-    sub.add_parser("sweep", help="varredura de inatividade")
+    sweep = sub.add_parser("sweep", help="varredura de inatividade")
+    sweep.add_argument(
+        "--url", help="servidor em execucao (ex.: http://127.0.0.1:8080); recomendado"
+    )
     sub.add_parser("health", help="configuração ativa e circuit breaker")
     for p in (chat, demo):
         p.add_argument("--db", default=":memory:", help="SQLite de sessões (padrão: em memória)")
@@ -177,6 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(cmd_chat(settings, args.session))
         if args.cmd == "demo":
             return asyncio.run(cmd_demo(settings, args.only))
+        if args.cmd == "sweep" and args.url:
+            return asyncio.run(cmd_sweep_remote(settings, args.url))
         if args.cmd == "sweep":
             return asyncio.run(cmd_sweep(settings))
         return asyncio.run(cmd_health(settings))

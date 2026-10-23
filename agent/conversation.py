@@ -22,8 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import hmac
 import logging
+import secrets
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -38,6 +42,7 @@ from agent.handoff import (
     Reason,
     lead_message,
 )
+from agent.lifecycle import MAX_FOLLOWUPS, SessionPolicy
 from agent.llm import LLMAdapter, LLMUnavailable, NullLLM
 from agent.pii_masker import MaskingError, PIILeakError, find_leaks, parse_known_names
 from agent.prompt_safety import (
@@ -69,7 +74,7 @@ SECURITY_STRIKES_FOR_H14: Final = 2
 HISTORY_LIMIT: Final = 5
 MAX_LLM_REPLY_CHARS: Final = 900
 FOLLOWUP_AFTER_SECONDS: Final = 900.0
-MAX_FOLLOWUPS: Final = 2
+IDEMPOTENCY_WINDOW: Final = 50  # ultimos message_id lembrados por sessao
 
 
 class QuoteProvider(Protocol):
@@ -119,6 +124,8 @@ class Session:
     last_activity: float = 0.0
     followups_sent: int = 0
     pending_notice: str = ""  # aviso unico exibido no proximo turno (ex.: sessao restaurada)
+    # cache de idempotencia: SO memoria, nunca em to_record(); some junto com a sessao
+    idem: OrderedDict[str, _IdemEntry] = field(default_factory=OrderedDict)
 
     def to_record(self) -> dict[str, Any]:
         """Registro persistivel/logavel: nenhum campo volatil (CEP completo, nomes, texto cru)."""
@@ -199,6 +206,18 @@ class AgentReply:
     handoff: HandoffPackage | None = None
     security_review: bool = False
     codes: tuple[str, ...] = ()
+    snapshot: Any = None  # resposta completa montada DENTRO do lock (ver Agent.handle_message)
+    replay: bool = False  # True quando veio do cache de idempotencia
+
+
+@dataclass(frozen=True, slots=True)
+class _IdemEntry:
+    text_mac: bytes  # HMAC da mensagem (chave aleatoria do processo): o texto cru nunca e guardado
+    reply: AgentReply  # inclui o snapshot completo da resposta original
+
+
+class IdempotencyConflict(Exception):  # noqa: N818
+    """Mesmo message_id com mensagem diferente. Nao carrega nenhum conteudo."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +241,7 @@ class Agent:
         store: SessionStore | None = None,
         clock: Callable[[], float] = time.time,
         followup_after: float = FOLLOWUP_AFTER_SECONDS,
+        policy: SessionPolicy | None = None,
     ) -> None:
         self._quotes = quote_client
         self._llm = llm or NullLLM()
@@ -233,12 +253,67 @@ class Agent:
         self._max_stagnant = max_stagnant_turns
         self.sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._inflight: dict[str, int] = {}  # turnos em curso OU aguardando o lock
+        self._idem_key = secrets.token_bytes(32)
+        self.policy = policy or SessionPolicy()
+        self.policy.validate(followup_after)  # falha cedo: TTL > ciclo de follow-ups etc.
+        self._last_purge = self._clock()
+        self._last_retention_purge = self._clock()
+        self._purge_keys: list[str] = []
+        self._purge_pos = 0
 
     # ---------------------------------------------------------------- API publica
     async def handle_message(
-        self, conversation_id: str, raw_text: str, *, sender_name: str | None = None
+        self,
+        conversation_id: str,
+        raw_text: str,
+        *,
+        sender_name: str | None = None,
+        message_id: str | None = None,
+        snapshot: Callable[[Session, AgentReply], Any] | None = None,
     ) -> AgentReply:
+        """Processa um turno. Com `message_id`, o turno e idempotente (ver `_process`).
+
+        `_inflight` conta turnos em curso OU aguardando o lock: enquanto > 0 a sessao e o lock
+        nao podem ser removidos pela politica de ciclo de vida. O incremento e sincrono (antes
+        de qualquer `await`), entao nenhuma varredura interleava entre a entrada e o contador.
+        """
+        self._inflight[conversation_id] = self._inflight.get(conversation_id, 0) + 1
+        try:
+            return await self._process(
+                conversation_id,
+                raw_text,
+                sender_name=sender_name,
+                message_id=message_id,
+                snapshot=snapshot,
+            )
+        finally:
+            left = self._inflight[conversation_id] - 1
+            if left:
+                self._inflight[conversation_id] = left
+            else:
+                del self._inflight[conversation_id]
+            self._maybe_purge()
+
+    async def _process(
+        self,
+        conversation_id: str,
+        raw_text: str,
+        *,
+        sender_name: str | None = None,
+        message_id: str | None = None,
+        snapshot: Callable[[Session, AgentReply], Any] | None = None,
+    ) -> AgentReply:
+        """Ordem dentro do lock da sessao: (1) consulta de replay, ANTES de qualquer mutacao;
+        (2) turno normal; (3) `snapshot(session, reply)` ainda DENTRO do lock, e so entao o
+        resultado e lembrado. Replay devolve o snapshot original (`reply.replay=True`), sem
+        tocar na sessao.
+        """
         async with self._locks.setdefault(conversation_id, asyncio.Lock()):  # 1 turno por vez
+            if message_id is not None:
+                replayed = self._replay(conversation_id, message_id, raw_text)
+                if replayed is not None:
+                    return replayed
             started = time.monotonic()
             session = self._session(conversation_id)
             if sender_name:
@@ -253,23 +328,173 @@ class Agent:
                 reply = dataclasses.replace(reply, text=f"{notice} {reply.text}")
             self._persist(session)
             self._log(session, before, reply, round((time.monotonic() - started) * 1000))
+            if snapshot is not None:
+                reply = dataclasses.replace(reply, snapshot=snapshot(session, reply))
+            if message_id is not None:
+                self._remember(session, message_id, raw_text, reply)
             return reply
 
+    # ---------------------------------------------------------------- idempotencia
+    def _mac(self, text: str) -> bytes:
+        return hmac.new(self._idem_key, text.encode(), hashlib.sha256).digest()
+
+    @staticmethod
+    def _message_ref(message_id: str) -> str:
+        return hashlib.sha256(message_id.encode()).hexdigest()[:8]  # nunca o id cru no log
+
+    def _replay(self, conversation_id: str, message_id: str, raw_text: str) -> AgentReply | None:
+        session = self.sessions.get(conversation_id)  # so memoria: nao cria nem restaura
+        entry = session.idem.get(message_id) if session is not None else None
+        if session is None or entry is None:
+            return None
+        ref = self._message_ref(message_id)
+        if not hmac.compare_digest(entry.text_mac, self._mac(raw_text)):
+            logger.warning(
+                "chat_idempotency_conflict",
+                extra={"conversation_id": conversation_id, "message_ref": ref},
+            )
+            raise IdempotencyConflict
+        logger.info(
+            "chat_replay",
+            extra={
+                "conversation_id": conversation_id,
+                "message_ref": ref,
+                "turn": session.turn,
+                "state_to": session.state.value,
+            },
+        )
+        return dataclasses.replace(entry.reply, replay=True)
+
+    def _remember(
+        self, session: Session, message_id: str, raw_text: str, reply: AgentReply
+    ) -> None:
+        session.idem[message_id] = _IdemEntry(self._mac(raw_text), reply)
+        while len(session.idem) > IDEMPOTENCY_WINDOW:
+            session.idem.popitem(last=False)
+
     def get_session(self, conversation_id: str) -> Session | None:
+        """Memoria ou SQLite. Sessao restaurada entra na memoria (respeitando o teto)."""
         if conversation_id in self.sessions:
             return self.sessions[conversation_id]
         if self._store is not None and (rec := self._store.load(conversation_id)):
             session = Session.from_record(rec)
-            self.sessions[conversation_id] = session
+            self._insert(conversation_id, session)
             return session
+        return None
+
+    def peek_session(self, conversation_id: str) -> Session | None:
+        """Leitura administrativa: NAO reinsere a sessao na memoria."""
+        if conversation_id in self.sessions:
+            return self.sessions[conversation_id]
+        if self._store is not None and (rec := self._store.load(conversation_id)):
+            return Session.from_record(rec)
         return None
 
     def _session(self, conversation_id: str) -> Session:
         session = self.get_session(conversation_id)
         if session is None:
             session = Session(conversation_id, last_activity=self._clock())
-            self.sessions[conversation_id] = session
+            self._insert(conversation_id, session)
         return session
+
+    def _insert(self, conversation_id: str, session: Session) -> None:
+        self._make_room()
+        self.sessions[conversation_id] = session
+
+    # ---------------------------------------------------------------- ciclo de vida (B2)
+    @staticmethod
+    def _protected(s: Session) -> bool:
+        """Lead com cotacao em andamento: NUNCA sai da memoria (a restauracao perde a cotacao e o
+        sweep passaria a expirar o lead em vez de aplicar o H11)."""
+        return s.state not in TERMINAL and s.quote_status == "ok"
+
+    def _busy(self, cid: str) -> bool:
+        lock = self._locks.get(cid)
+        return self._inflight.get(cid, 0) > 0 or (lock is not None and lock.locked())
+
+    def _evict(self, cid: str, reason: str) -> None:
+        # sincrono, sem await entre a checagem (_busy) e a remocao
+        self.sessions.pop(cid, None)
+        self._locks.pop(cid, None)
+        self._inflight.pop(cid, None)
+        logger.info(
+            "session_evicted",
+            extra={"conversation_id": cid, "kind": reason, "in_memory": len(self.sessions)},
+        )
+
+    def _expired(self, cid: str, s: Session, now: float) -> str | None:
+        if self._busy(cid) or self._protected(s):
+            return None
+        idle = now - s.last_activity
+        if s.state in TERMINAL:
+            return "terminal_grace" if idle >= self.policy.terminal_grace else None
+        return "inactive_ttl" if idle >= self.policy.inactive_ttl else None
+
+    def purge_sessions(self, limit: int | None = None) -> int:
+        """Remove da memoria sessoes vencidas. `limit=None` = passada completa; com `limit`, um
+        lote com cursor rotativo (varredura oportunista). Devolve quantas removeu."""
+        now = self._clock()
+        if limit is None:
+            keys = list(self.sessions)
+        else:
+            if self._purge_pos >= len(self._purge_keys):
+                self._purge_keys, self._purge_pos = list(self.sessions), 0
+            keys = self._purge_keys[self._purge_pos : self._purge_pos + limit]
+            self._purge_pos += limit
+        removed = 0
+        for cid in keys:
+            s = self.sessions.get(cid)
+            if s is None:
+                continue
+            reason = self._expired(cid, s, now)
+            if reason is not None:
+                self._evict(cid, reason)
+                removed += 1
+        return removed
+
+    def _make_room(self) -> None:
+        """Teto: terminais primeiro, depois nao terminais sem cotacao, sempre da mais antiga para a
+        mais nova; nunca as protegidas nem as em andamento. Se so restarem essas, aceita a nova
+        sessao e alerta (recusar um lead com cotacao seria pior)."""
+        cap = self.policy.max_sessions
+        if len(self.sessions) < cap:
+            return
+        movable = [(cid, s) for cid, s in self.sessions.items() if not self._busy(cid)]
+        terminals = sorted(
+            ((cid, s) for cid, s in movable if s.state in TERMINAL),
+            key=lambda x: x[1].last_activity,
+        )
+        idle = sorted(
+            ((cid, s) for cid, s in movable if s.state not in TERMINAL and not self._protected(s)),
+            key=lambda x: x[1].last_activity,
+        )
+        need = len(self.sessions) - cap + 1
+        evicted = 0
+        for cid, _ in [*terminals, *idle]:
+            if evicted >= need:
+                break
+            self._evict(cid, "cap")
+            evicted += 1
+        if evicted < need:
+            logger.warning(
+                "session_cap_protected_only",
+                extra={"in_memory": len(self.sessions), "evicted": evicted},
+            )
+
+    def _maybe_purge(self) -> None:
+        """Varredura oportunista (sem dependencia nova): no maximo a cada `purge_interval`."""
+        now = self._clock()
+        if now - self._last_purge < self.policy.purge_interval:
+            return
+        self._last_purge = now
+        self.purge_sessions(limit=self.policy.purge_batch)
+        self._purge_store_retention(now, min_interval=3_600.0)
+
+    def _purge_store_retention(self, now: float, *, min_interval: float = 0.0) -> int:
+        if self._store is None or now - self._last_retention_purge < min_interval:
+            return 0
+        self._last_retention_purge = now
+        return self._store.purge_terminal(now - self.policy.retention_seconds)
 
     def _persist(self, s: Session) -> None:
         if self._store is not None:
@@ -301,9 +526,11 @@ class Agent:
                 actions.append(IdleAction(cid, "follow_up", render.FOLLOW_UP))
             elif s.quote_status == "ok":
                 reply = self._handoff(s, Reason.H11)
+                s.last_activity = now  # a carencia do terminal conta a partir do fim
                 actions.append(IdleAction(cid, "handoff_h11", reply.text))
             else:
                 s.state = transition(s.state, Event.EXPIRE)
+                s.last_activity = now
                 s.audit.append({"turn": s.turn, "idle": "expired"})
                 actions.append(IdleAction(cid, "expired", render.EXPIRED))
             self._persist(s)
@@ -311,6 +538,8 @@ class Agent:
                 "idle_action",
                 extra={"conversation_id": cid, "kind": actions[-1].kind, "state_to": s.state.value},
             )
+        self.purge_sessions()  # passada completa de ciclo de vida
+        self._purge_store_retention(now)
         return actions
 
     # ---------------------------------------------------------------- turno
