@@ -1,135 +1,214 @@
-# Desafio Técnico — FDE / AI Engineer (Namastex)
+# AutoSeguro — Agente de cotação de seguro auto (WhatsApp)
 
-Bem-vindo(a)! Este é um teste **take-home** que espelha o trabalho real de um FDE
-(Forward Deployed Engineer) na Namastex: subir um **agente de verdade**, conectado a
-sistemas que nem sempre colaboram, em cima de **dados bagunçados do mundo real**.
+Agente que conversa com o lead, qualifica, **cota via `POST /quote`** (legado instável de propósito) e
+decide, **por regras em código**, quando resolver sozinho e quando passar para um humano.
+Desafio FDE / AI Engineer — Namastex (enunciado original em [`docs/ENUNCIADO.md`](docs/ENUNCIADO.md)).
 
-> ⏱️ **Tempo:** ~3 dias de relógio. **Espera-se que você use AI coding tools**
-> (Claude Code, Cursor, ChatGPT, etc.) — isso é a régua aqui, não trapaça. A gente quer ver
-> você orquestrando IA pra entregar com qualidade e velocidade.
->
-> 📎 Por isso mesmo: **as conversas que você teve com as IAs fazem parte da entrega.**
-> Veja [Transparência de uso de IA](#transparência-de-uso-de-ia-obrigatório) — é obrigatório.
+| Entregável | Onde |
+|---|---|
+| Agente (código) | [`agent/`](agent/) · API em [`agent/app.py`](agent/app.py) · CLI em [`agent/cli.py`](agent/cli.py) |
+| README + decisões | este arquivo e [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) (documento de arquitetura completo) |
+| **Log de uma execução completa** | [`logs/EXECUCAO_COMPLETA.md`](logs/EXECUCAO_COMPLETA.md) (legível) e [`logs/execucao_completa.jsonl`](logs/execucao_completa.jsonl) (eventos) |
+| Conversas com IA | [`ai-logs/`](ai-logs/) |
 
----
+## 1. Visão geral
 
-## O cenário
+```
+WhatsApp/HTTP ─► POST /chat ─► Privacy Gateway ─► Orquestrador (FSM) ─► QuoteClient ─► POST /quote (legado)
+                  session_id        normaliza →            │   ▲            timeout 10 s · retry · breaker
+                  pseudonimizado    mascara PII →          │   └─ slots extraídos EM CÓDIGO (CEP completo só em memória)
+                                    <user_message>         ├─► Handoff H1–H14 + C1 (decidido por código, nunca pelo LLM)
+                                                           └─► LLM opcional (só dúvidas livres) ─► guardrails de saída
+```
 
-Você é o engenheiro responsável por uma seguradora fictícia, a **AutoSeguro**. O time
-de vendas atende leads por **WhatsApp** e fecha seguro de **veículo**. Sua missão é
-construir um **agente** que:
+**Princípios (regras operacionais completas em [`CLAUDE.md`](CLAUDE.md))**
 
-1. **Conversa** com o lead, qualifica e **cota um plano** usando a nossa API de cotação.
-2. **Decide** quando consegue resolver sozinho e quando precisa **passar pra um humano**.
-3. Não trava nem inventa preço quando a infraestrutura falha.
+1. **Regra de Ouro:** o preço vem **exclusivamente** do `POST /quote`. O LLM nunca calcula, estima ou "lembra"
+   valores: o texto da cotação é renderizado por template a partir do objeto `Quote` validado, e um guardrail de
+   saída barra qualquer valor monetário fora do `Quote`.
+2. **Handoff é código:** o LLM não decide transições. Os 14 gatilhos (+ fechamento comercial) são regras explícitas.
+3. **PII fail-closed:** se o mascaramento falha ou há dúvida, o dado é descartado — nunca enviado "como está".
+4. **Falha nunca vira alucinação:** `/quote` fora do ar ⇒ nenhum número é dito, a conversa vai para um humano.
 
-Te entregamos três coisas (tudo neste repo):
+O LLM é **opcional** (`LLM_PROVIDER=none` por padrão): com ele desligado o agente é 100% determinístico e passa
+em toda a suíte de integração.
 
-| Insumo | Onde | O que é |
-|---|---|---|
-| **API de cotação** | `quote-service/` | Serviço HTTP `POST /quote` que você sobe local com Docker |
-| **Histórico de conversas** | `dataset/conversations.parquet` | ~2.500 conversas reais* lead↔vendedor (*sintéticas, ver dicionário) |
-| **Dicionário de dados** | `dataset/DICIONARIO.md` | Esquema do dataset |
+## 2. Como rodar em 1 minuto
 
----
-
-## Subindo a API de cotação
+**Docker Compose** (sobe `quote-service` + `agent`):
 
 ```bash
 docker compose up --build
-# API em http://localhost:8000
+curl localhost:8080/health?deep=true | python3 -m json.tool          # config ativa + breaker + ping no legado
+curl -s localhost:8080/chat -H 'content-type: application/json' \
+  -d '{"session_id":"demo-1","message":"Oi, quero cotar um seguro"}' | python3 -m json.tool
 ```
 
-Sem Docker? Dá pra rodar direto:
+**Sem Docker** (Python 3.12 + [uv](https://docs.astral.sh/uv/)):
 
 ```bash
-cd quote-service && uv run uvicorn app.main:app --port 8000
+uv sync
+(cd quote-service && uv run uvicorn app.main:app --port 8000) &          # legado instável (20% falha, 10% lento)
+uv run uvicorn agent.app:production_app --factory --port 8080            # API do agente
 ```
 
-Endpoints:
-
-- `GET  /health` — health check
-- `GET  /planos` — tabela de planos **e as regras de cotação** (leia com atenção)
-- `POST /quote` — calcula a cotação
-
-Exemplo:
+**CLI** (usa a mesma app em processo; fala com o `quote-service` em `QUOTE_API_URL`):
 
 ```bash
-curl -X POST localhost:8000/quote -H 'content-type: application/json' \
-  -d '{"plano_id":"completo","idade":35,"veiculo_ano":2022,"cep":"01310-100","data_inicio":"2026-07-15"}'
+uv run python -m agent.cli chat                       # conversa interativa (/estado, /sair)
+uv run python -m agent.cli demo --spawn-quote         # 4 cenários automatizados, sobe o legado sozinho
+uv run python -m agent.cli health                     # config ativa + circuit breaker
+uv run python -m agent.cli sweep                      # follow-ups / encerramento de sessões inativas
 ```
 
-> ⚠️ **Aviso de operação:** a `/quote` simula um sistema legado real — ela **não responde
-> de primeira toda vez** (falhas e lentidão acontecem). Seu agente precisa lidar com isso
-> de forma elegante. Tratar bem a instabilidade é parte central do desafio.
+**Testes e lint:**
 
----
+```bash
+uv run pytest -q            # 435 testes (unitários, segurança adversarial, integração ponta a ponta)
+uv run ruff check agent tests scripts/run_reference_execution.py
+```
 
-## O que entregar
+**Reproduzir o log oficial de execução** (sobe o `quote-service` com as taxas padrão e `QUOTE_SEED=1`, que faz a
+1ª chamada falhar e a 2ª ser lenta; ~20 s):
 
-1. **Um agente** que atende um lead de ponta a ponta: conversa → qualifica → cota → decide
-   (resolve ou encaminha pro humano, com critério claro).
-2. **Repositório público no GitHub** com o código.
-3. **README** explicando como rodar e **as decisões que você tomou** (e por quê).
-4. **Log de uma execução completa** (uma conversa do início ao fim, com a cotação saindo).
-5. **As suas conversas com as IAs**, exportadas dentro do repo — ver a seção abaixo.
+```bash
+uv run python scripts/run_reference_execution.py      # regrava logs/execucao_completa.jsonl e logs/EXECUCAO_COMPLETA.md
+```
 
-Você pode usar o dataset de conversas como bem entender (ex.: few-shot, avaliação,
-entender padrões de objeção, testar seu agente). Use o que fizer sentido pra sua solução.
+**Regerar a camada Silver** (Bronze → Silver, relatório sem PII em [`docs/silver_report.json`](docs/silver_report.json)):
 
----
+```bash
+uv run python -m agent.silver
+```
 
-## Transparência de uso de IA (obrigatório)
+Configuração por ambiente (`agent/settings.py`): `QUOTE_API_URL`, `SESSION_DB`, `SESSION_ID_SALT`, `ADMIN_TOKEN`,
+`FOLLOWUP_AFTER_SECONDS`, `LOG_FILE`, `LOG_LEVEL`, `LLM_PROVIDER` (`none|mock|anthropic`) + `ANTHROPIC_API_KEY`, `LLM_MODEL`.
 
-A gente **quer** que você use IA — e faz parte da entrega mostrar o processo, não só o
-resultado final. Esses logs **entram na avaliação** junto com o código.
+### API
 
-**Exporte todas as conversas que você teve com IAs durante o desafio** — ChatGPT,
-Claude Code, Cursor, Copilot Chat, Gemini, o que tiver usado — e **inclua no repo**,
-numa pasta `ai-logs/`.
-
-Como exportar, por ferramenta:
-
-| Ferramenta | Como |
+| Endpoint | O que faz |
 |---|---|
-| **ChatGPT** | Menu da conversa → *Share* (link público) ou *Export*. Cole o link ou salve o arquivo |
-| **Claude.ai** | Menu da conversa → *Share* ou *Export* |
-| **Claude Code** | As sessões ficam em `~/.claude/projects/<slug-do-projeto>/*.jsonl` — copie os arquivos |
-| **Codex CLI** | Sessões em `~/.codex/sessions/` |
-| **Cursor / Windsurf** | Exporte ou copie o histórico do painel de chat pra um `.md` |
-| **Copilot Chat / outros** | Copie e cole num `.md` mesmo — serve |
+| `GET /health[?deep=true]` | status, **estado do circuit breaker**, timeouts/deadline/tentativas ativos, LLM, persistência; `deep` pinga o legado |
+| `POST /chat` `{session_id, message}` | processa um turno: resposta, `state`, `turn_id`, `slots` (CEP só `cep_prefix`), `quote_status`, `quote` (valores da API), `handoff` |
+| `GET /sessions/{id}` | histórico **mascarado** + rastro de auditoria, sem PII (token admin se `ADMIN_TOKEN`) |
+| `POST /maintenance/sweep` | follow-ups (até 2) e encerramento de sessões silenciosas; complementa o H11 |
 
-Não precisa ser bonito. Um `.jsonl` cru, um `.md` com copy-paste ou uma lista de links
-públicos resolve — pode mandar o histórico como ele saiu.
+## 3. Resiliência na `/quote`
 
-> ⚠️ **Tire os seus segredos antes de commitar** (API keys, tokens, dados pessoais seus).
-> Isso vai pra um repo público.
+O legado falha (~20% de 500/502/503) e demora 8 s (~10%). Implementação em [`agent/quote_client.py`](agent/quote_client.py):
 
-Se a exportação não for viável na sua ferramenta, **avise antes de entregar** — a gente
-combina uma sessão de tela compartilhada pra você mostrar o passo a passo, e está tudo certo.
+| Decisão | Por quê |
+|---|---|
+| **Timeout de leitura de 10 s** por tentativa | a chamada lenta responde **200 após 8 s**; com 5 s cada uma geraria retry inútil e carga dobrada no legado |
+| **Deadline total de 28 s** | o backoff e a última tentativa são truncados pelo que resta: o pior caso (3 × 10 s + backoff = 38 s) nunca estoura |
+| **Retry seletivo** (tenacity, backoff exponencial + full jitter) | só `500/502/503/504`, timeout e erro de conexão. `400` e `422` são definitivos: **nunca** há retry |
+| **Circuit breaker por operação** | conta falhas só depois de esgotar os retries, senão os 20% de ruído de base abririam o circuito; `4xx` zera a contagem; 1 sonda em half-open |
+| **Cache idempotente** (TTL 300 s, só sucessos) | mesma consulta não repete a chamada; funciona com o circuito aberto |
+| Falha esgotada ⇒ `QuoteUnavailable` ⇒ **H5/H6** | nenhum preço inventado: o lead é encaminhado a um humano |
 
----
+Evidência: no log oficial a 1ª tentativa tomou **HTTP 500**, a 2ª foi a **resposta lenta de 8 s** e mesmo assim o
+lead recebeu a cotação; na carga de 20 conversas concorrentes 5 de 5 operações com retry cotaram.
 
-## Como a gente vai olhar
+## 4. Governança de PII e segurança anti-injection
 
-Sem pegadinha escondida na avaliação — o que importa:
+**Camada de dados** ([`agent/pii_masker.py`](agent/pii_masker.py), [`agent/silver.py`](agent/silver.py))
 
-- **Funciona de ponta a ponta?** O agente cota certo e não quebra no caminho feliz.
-- **O que ele faz quando a `/quote` falha?** (esse é o ponto que mais separa.)
-- **O critério de passar pro humano é explícito e defensável?**
-- **Dá pra rastrear o que aconteceu?** (cada mensagem/cotação, com id e status.)
-- **Cuidado com dados sensíveis.** O histórico tem informação pessoal — pense nisso.
-- **Qualidade:** outro engenheiro consegue pegar seu código e entender as decisões?
-- **Como você usou a IA.** Os `ai-logs/` entram na avaliação junto com o código.
+- **Bronze → Silver:** 26.470 mensagens / 2.500 conversas processadas, **0 em quarentena**, e uma prova de zero
+  vazamento contra os valores originais do dataset (CPF, e-mail, telefone, placa, CEP e nomes de `sender_name`).
+  `sender_name` não vai para a Silver (vira `lead` / `vendedor_N`).
+- Mascara CPF (valida os dígitos), e-mail, telefone, placa, nomes, endereços e números longos. **Do CEP sobra só
+  `cep[:2]`** (`[CEP:01]`) — o que a regra de risco regional precisa. Marcadores `[documento] [imagem] [audio]` são preservados.
+- **Fail-closed em duas camadas:** `mask_text` (erro ⇒ descarta) + `assert_clean` independente e mais largo; o erro
+  nunca contém o valor vazado. Conversa inteira vai para quarentena se qualquer mensagem falhar.
 
-> 💡 Não existe "formato de saída certo" definido de propósito. Queremos ver **a sua decisão** de engenharia.
+**CEP volátil × `cep[:2]`:** o `POST /quote` exige o CEP completo. Ele é extraído do texto **cru** antes do
+mascaramento e vive só em `Slots.cep` (memória da sessão), sendo usado uma vez para montar o payload. Logs,
+SQLite, registros, pacotes de handoff, histórico e prompts só veem `cep[:2]`. Um teste estático garante que
+nenhum módulo além de `slots.py` toca `.cep`, e a persistência **recusa gravar** CEP/CPF/e-mail em disco.
+Após reinício o agente retoma a sessão e **pede o CEP de novo**.
 
----
+**Borda HTTP:** o `session_id` (que pode ser o telefone) é pseudonimizado com HMAC (`SESSION_ID_SALT`) antes de
+entrar no agente — logs e banco só conhecem `c_<hex>`. Os logs são JSONL com **lista branca** de campos: um
+`extra=` descuidado não consegue vazar texto de mensagem.
 
-## Entrega
+**Anti-injection** ([`agent/prompt_safety.py`](agent/prompt_safety.py))
 
-Mande o link do repo público — com o código **e** a pasta `ai-logs/`.
-Qualquer dúvida, fale com quem te enviou o desafio.
-Quando começar, **avise** — a gente marca a conversa de feedback logo depois da entrega.
+- **Normalização Unicode hostil** antes de tudo: NFKC, decodifica entidades HTML/percent-encoding, remove
+  zero-width/bidi/tag chars/marcas combinantes/fillers Hangul e braille, resolve homóglifos cirílicos/gregos.
+- **Confinamento:** texto do lead mascarado e escapado (`& < >`) dentro de `<user_message>…</user_message>`; o lead não
+  consegue fechar o bloco nem forjar `<system>`. Detecta override de instruções, roubo do system prompt, troca de papel,
+  manipulação de preço e burla de handoff, inclusive ofuscados (letras espaçadas, rot13, base64, invertido).
+- **Saída do LLM:** só valores do `Quote` passam; canário + trechos literais barram vazamento do system prompt.
+- **Precedência H14:** 1º sinal duro ⇒ resposta fixa, **sem LLM, sem handoff, sem extrair slots**, contador +1;
+  2º sinal ⇒ H14 com `security_review` em fila separada. A segurança vale **antes** de H1/H2/H3, então um ataque
+  disfarçado de "quero um atendente" não envenena a fila comercial. Testado com 15 sessões × 5 ataques ⇒ 15 tickets.
 
-Boa! 🚀
+## 5. Matriz de handoff determinística
+
+Avaliada em código a cada mensagem (primeira regra que casa vence): sessão terminal → privacidade (H4) →
+**injection (H14)** → H1 → H2 → H3 → H12 → slots/estado (H10, H13, H11) → QuoteClient (H5–H8) → guardrails de saída (H9).
+
+| Código | Gatilho | Detecção |
+|---|---|---|
+| H1 | pedido explícito de humano | léxico sobre texto normalizado ("não quero humano" não conta) |
+| H2 | reclamação / ameaça (Procon, advogado, golpe, cancelar) | léxico |
+| H3 | fora de escopo (sinistro, apólice, boleto, endosso) | léxico |
+| H4 | falha do gateway de privacidade (`MaskingError`/`PIILeakError`) | exceção; CPF enviado espontaneamente **não** é H4 (é mascarado e avisado) |
+| H5 | `/quote` indisponível após retries | `QuoteUnavailable` |
+| H6 | circuit breaker aberto | `CircuitOpen` |
+| H7 | cotação recusada (422: idade > 75, veículo > 20 anos…) | `QuoteRefused`; o **motivo vem da API** |
+| H8 | 400 inesperado | `QuoteInvalidPayload` |
+| H9 | guardrail de saída violado (template) ou 2ª violação do LLM | verificadores de preço/PII/system prompt |
+| H10 | 3 respostas inválidas/ausentes no mesmo slot | contador por slot |
+| H11 | sem progresso (12 turnos) **ou lead silencioso após 2 follow-ups** com cotação entregue | contadores + `POST /maintenance/sweep` |
+| H12 | negociação fora da política (desconto, exceção) | léxico |
+| H13 | ambiguidade em slot crítico após reconfirmar ("30 ou 40 anos") | extrator |
+| H14 | **prompt injection reincidente** (2º sinal duro) | `injection_signals`, `security_review=true` |
+| C1 | lead quer contratar | não é exceção: encerra (`ENDED`) com pacote para finalizar com humano |
+
+Todo handoff gera um **pacote mascarado** (motivo, estado de origem, slots sanitizados, `quote_id`, últimas mensagens
+mascaradas), é **idempotente** e usa mensagem fixa e honesta (sem prometer prazo ou preço).
+
+## 6. Rastreabilidade
+
+- [`logs/`](logs/): `agent_turn` (estado, códigos, `quote_id`, latência), `quote_attempt` (tentativa, resultado, latência,
+  estado do breaker) e `http_request`, ligados por IDs: `turn_id = <conversa>:<turno>` e `request_id = <conversa>-<turno>`.
+- `GET /sessions/{id}`: histórico mascarado + auditoria por sessão. `HandoffPackage` registra motivo e origem.
+- [`ai-logs/`](ai-logs/): decisões, bugs achados e como a IA foi usada, etapa a etapa (inclui as reprovações do arquiteto).
+
+## 7. Como o dataset foi usado
+
+`dataset/conversations.parquet` (sintético) serviu para: (i) **prova de zero vazamento** do mascarador contra os
+valores originais; (ii) **regressão de falsos positivos** — nenhuma mensagem de lead aciona H1/H2/H3/H12 nem sinal de
+injection; (iii) **replay de 150 conversas reais** pelo agente (0 quebras, 0 vazamentos); (iv) entender o formato real
+das mensagens (CPF/CEP soltos, dados fora de ordem). Ele não alimenta preços nem prompts.
+
+## 8. Qualidade
+
+435 testes: cliente HTTP (retry/deadline/breaker/cache), mascarador (fuzz + dataset inteiro), segurança
+adversarial (LLM simulado que obedece ao atacante), FSM/slots/números por extenso, matriz H1–H14+C1 parametrizada
+contra o agente real, API, persistência e inatividade. Cada regra crítica foi validada por **teste de mutação manual**
+(desligar a defesa derruba um teste); os mutantes que sobreviveram revelaram lacunas que viraram testes.
+
+## 9. Limitações conhecidas (honestas)
+
+- **Imagem Docker não construída nesta sessão** (sem daemon Docker): o `Dockerfile` foi validado instalando só as
+  dependências de produção do `uv.lock` em ambiente limpo e subindo o servidor real contra o `quote-service`.
+- Provedor **Anthropic** testado só com HTTP mockado (sem chave/rede reais). Com `LLM_PROVIDER=none` nada depende dele.
+- Sem canal real de WhatsApp: `POST /chat` é a borda; follow-ups de inatividade são devolvidos por `POST /maintenance/sweep`
+  para o canal entregar. O canal precisa guardar o mapeamento `session_id ↔ pseudônimo` (o agente não o persiste de propósito).
+- Mascaramento determinístico: nome próprio fora do dicionário/pistas de contexto/`sender_name`, e dígitos de documentos
+  escritos por extenso, não são detectáveis por regras. Léxicos e extração de slots são só pt-BR.
+- Injeção semântica sem palavras-chave escapa da detecção; a defesa nesse caso é estrutural (confinamento + guardrails + handoff).
+- Persistência em SQLite local de processo único; escala horizontal exigiria um store compartilhado (a interface já existe).
+
+## 10. Estrutura
+
+```
+agent/        quote_client · pii_masker · silver · prompt_safety · numbers_pt · slots · intents · fsm · render
+              handoff · llm · conversation · store · settings · logging_setup · app (FastAPI) · cli · demo
+tests/        suítes por módulo + e2e + segurança adversarial
+scripts/      run_reference_execution.py (log oficial) · generate_dataset.py (do desafio)
+quote-service/ legado simulado (não alterado)      dataset/ Bronze sintético      docs/ arquitetura e relatórios
+logs/         execução completa (entregável #4)   ai-logs/ conversas e decisões com IA (entregável #5)
+```
