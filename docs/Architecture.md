@@ -566,3 +566,10 @@ com `agent` parado (comportamento do `resolve`) · 403 (GET no chat) / 404 (rota
 portas 8000/8080 só em loopback (`ss -ltn`) · IP real no rate limit (duas origens → buckets distintos) · ausência
 de IP/query nos logs do `web` (`docker compose logs web`) · `message_id` ponta a ponta, incluindo **reload com
 mensagem órfã** · sweep agendado funcionando.
+
+#### Verificado localmente nesta implementação (sem Docker)
+
+nginx 1.24 real com o `nginx.conf` + agente real + Chromium (Playwright): 403/404/429, IP real via `CF-Connecting-IP`
+no rate limit, ausência de IP/query nos logs, `message_id` ponta a ponta (inclui reload com mensagem órfã e 409).
+**Não verificado** (exige Docker e/ou nginx ≥ 1.27.3): `!override`, `resolve` ao vivo, agente recriado, subida do
+`web` com `agent` ausente, bind em loopback — itens acima, a executar no servidor.

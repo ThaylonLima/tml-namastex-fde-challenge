@@ -64,8 +64,9 @@ uv run python -m agent.cli sweep                      # follow-ups / encerrament
 **Testes e lint:**
 
 ```bash
-uv run pytest -q            # 435 testes (unitários, segurança adversarial, integração ponta a ponta)
+uv run pytest -q            # 522 testes (unitários, segurança adversarial, integração ponta a ponta)
 uv run ruff check agent tests scripts/run_reference_execution.py
+uv run ruff format --check agent tests scripts/run_reference_execution.py
 ```
 
 **Reproduzir o log oficial de execução** (sobe o `quote-service` com as taxas padrão e `QUOTE_SEED=1`, que faz a
@@ -82,14 +83,15 @@ uv run python -m agent.silver
 ```
 
 Configuração por ambiente (`agent/settings.py`): `QUOTE_API_URL`, `SESSION_DB`, `SESSION_ID_SALT`, `ADMIN_TOKEN`,
-`FOLLOWUP_AFTER_SECONDS`, `LOG_FILE`, `LOG_LEVEL`, `LLM_PROVIDER` (`none|mock|anthropic`) + `ANTHROPIC_API_KEY`, `LLM_MODEL`.
+`FOLLOWUP_AFTER_SECONDS`, `LOG_FILE`, `LOG_LEVEL`, `LLM_PROVIDER` (`none|mock|anthropic`) + `ANTHROPIC_API_KEY`, `LLM_MODEL`,
+`SESSION_TERMINAL_GRACE_SECONDS`, `SESSION_INACTIVE_TTL_SECONDS`, `SESSION_MAX_IN_MEMORY`, `SESSION_RETENTION_DAYS`.
 
 ### API
 
 | Endpoint | O que faz |
 |---|---|
 | `GET /health[?deep=true]` | status, **estado do circuit breaker**, timeouts/deadline/tentativas ativos, LLM, persistência; `deep` pinga o legado |
-| `POST /chat` `{session_id, message}` | processa um turno: resposta, `state`, `turn_id`, `slots` (CEP só `cep_prefix`), `quote_status`, `quote` (valores da API), `handoff` |
+| `POST /chat` `{session_id, message[, message_id]}` | processa um turno: resposta, `state`, `turn_id`, `slots` (CEP só `cep_prefix`), `quote_status`, `quote` (valores da API), `handoff` |
 | `GET /sessions/{id}` | histórico **mascarado** + rastro de auditoria, sem PII (token admin se `ADMIN_TOKEN`) |
 | `POST /maintenance/sweep` | follow-ups (até 2) e encerramento de sessões silenciosas; complementa o H11 |
 
@@ -183,9 +185,30 @@ valores originais; (ii) **regressão de falsos positivos** — nenhuma mensagem 
 injection; (iii) **replay de 150 conversas reais** pelo agente (0 quebras, 0 vazamentos); (iv) entender o formato real
 das mensagens (CPF/CEP soltos, dados fora de ordem). Ele não alimenta preços nem prompts.
 
+### Idempotência, TTL de sessões e retenção (v0.5.0)
+
+- **`message_id` opcional** (`^[A-Za-z0-9_-]{8,64}$`): reenviar o mesmo `message_id` com o mesmo texto devolve a resposta
+  anterior **idêntica** (snapshot completo gerado dentro do lock da sessão), com o header `X-Idempotent-Replay: true`, sem
+  reprocessar o turno. Mesmo id com texto diferente ⇒ `409`. Só respostas `200` são memorizadas; janela de ~50 por sessão,
+  apenas em memória. Guardamos HMAC do texto (nunca o texto) e nunca logamos o id cru. Sem `message_id` o comportamento é o de antes.
+- **Sessões em memória** não crescem sem limite: sessão **não terminal com cotação `ok` nunca é expulsa**; terminais saem após
+  `SESSION_TERMINAL_GRACE_SECONDS`; sem cotação, inativas saem após `SESSION_INACTIVE_TTL_SECONDS` (validado contra o ciclo
+  completo de follow-ups); no teto `SESSION_MAX_IN_MEMORY` expulsa terminais e depois as inativas mais antigas (se só restam
+  protegidas, aceita a nova e registra alerta). Sessão com turno em andamento nunca é removida.
+- **Retenção no SQLite**: sessões terminais são apagadas após `SESSION_RETENTION_DAYS` (padrão 30).
+- **O sweep precisa ser agendado** (o agente não tem scheduler). Exemplo de cron a cada 5 min:
+  `*/5 * * * * cd /opt/autoseguro && uv run python -m agent.cli sweep` ou
+  `curl -fsS -X POST -H "X-Admin-Token: $ADMIN_TOKEN" http://127.0.0.1:8000/maintenance/sweep`.
+
+### Interface web (extra, `web/`)
+
+UI estática + nginx (`docker-compose.web.yml`), com `message_id` por mensagem e reenvio seguro. Decisões de proxy,
+LGPD nos logs, deploy e rollback: [`web/README.md`](web/README.md) e `docs/ARQUITETURA.md` §13.
+**Deploy:** agent primeiro, depois web. **Rollback:** web primeiro, depois agent (o agente antigo rejeita `message_id` com 422).
+
 ## 8. Qualidade
 
-435 testes: cliente HTTP (retry/deadline/breaker/cache), mascarador (fuzz + dataset inteiro), segurança
+522 testes (435 originais, inalterados, + idempotência, TTL, contrato web e scanner de ai-logs): cliente HTTP (retry/deadline/breaker/cache), mascarador (fuzz + dataset inteiro), segurança
 adversarial (LLM simulado que obedece ao atacante), FSM/slots/números por extenso, matriz H1–H14+C1 parametrizada
 contra o agente real, API, persistência e inatividade. Cada regra crítica foi validada por **teste de mutação manual**
 (desligar a defesa derruba um teste); os mutantes que sobreviveram revelaram lacunas que viraram testes.
@@ -200,6 +223,8 @@ contra o agente real, API, persistência e inatividade. Cada regra crítica foi 
 - Mascaramento determinístico: nome próprio fora do dicionário/pistas de contexto/`sender_name`, e dígitos de documentos
   escritos por extenso, não são detectáveis por regras. Léxicos e extração de slots são só pt-BR.
 - Injeção semântica sem palavras-chave escapa da detecção; a defesa nesse caso é estrutural (confinamento + guardrails + handoff).
+- Idempotência e janela de replay são por processo (memória): após reinício do agente um reenvio é reprocessado.
+- Validações que exigem Docker/nginx ≥ 1.27.3 (Compose `!override`, `resolve` ao vivo, bind em loopback) estão listadas em `docs/ARQUITETURA.md` §13.5 e não foram executadas nesta sessão.
 - Persistência em SQLite local de processo único; escala horizontal exigiria um store compartilhado (a interface já existe).
 
 ## 10. Estrutura
