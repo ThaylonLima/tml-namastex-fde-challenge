@@ -23,6 +23,7 @@
     --warn: #9a5b00;
     --warn-soft: #fbefd9;
     --danger: #b42318;
+    --danger-soft: #fde8e6;
     --ok: #138a4a;
     --radius: 18px;
     --shadow: 0 1px 2px rgba(16, 24, 20, .06), 0 8px 24px rgba(16, 24, 20, .06);
@@ -44,6 +45,7 @@
       --warn: #f5b84a;
       --warn-soft: #33270f;
       --danger: #f97066;
+      --danger-soft: #3b1714;
       --ok: #47cd89;
       --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
       color-scheme: dark;
@@ -213,6 +215,10 @@
   .slots dd.empty { color: var(--muted); opacity: .6; }
   .banner { border-radius: 12px; padding: 12px 14px; font-size: 13.5px; background: var(--warn-soft); }
   .banner strong { display: block; margin-bottom: 2px; }
+  .banner small { display: block; margin-top: 4px; opacity: .8; }
+  .banner.danger { background: var(--danger-soft); }
+  .row.system.alert .bubble { color: var(--danger); }
+  .meta .unsent { color: var(--danger); }
   .tech { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
   .tech code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--text); }
   .note { font-size: 12px; color: var(--muted); margin: 0; }
@@ -249,7 +255,7 @@
       </div>
     </div>
     <div class="spacer"></div>
-    <span class="status" id="status" data-s="unknown" title="Saúde do agente (GET /health)"><span class="dot"></span><span id="statusText">Verificando…</span></span>
+    <span class="status" id="status" data-s="unknown" title="Estado inferido pelas respostas do agente (a rota /health não é publicada)"><span class="dot"></span><span id="statusText">Status desconhecido</span></span>
     <button class="btn" id="reset" type="button" aria-label="Nova conversa">Nova<span class="reset-long"> conversa</span></button>
   </header>
 
@@ -292,6 +298,7 @@
       <dl class="slots" id="slots"></dl>
     </section>
     <div class="banner hidden" id="banner"></div>
+    <div class="banner hidden" id="alert" role="alert"></div>
     <section class="card">
       <h2>Bastidores</h2>
       <div class="tech" id="tech"><span>Nenhum turno ainda.</span></div>
@@ -305,10 +312,10 @@
   "use strict";
 
   // Caminhos relativos: funciona em /autoseguro/ (via proxy) sem configuração extra.
+  // Não há mais consulta a /health: a rota não é publicada; o status é inferido pelas respostas do /chat.
   const API_CHAT = "api/chat";
-  const API_HEALTH = "api/health?deep=true";
   const REQUEST_TIMEOUT_MS = 45000;   // a quote-api simula lentidão (8s) e retentativas
-  const STORE_KEY = "autoseguro.chat.v1";
+  const STORE_KEY = "autoseguro.chat.v2";
 
   const STATE_ORDER = ["greeting", "qualifying", "confirming", "quoting", "presenting", "closing"];
   const STATE_LABEL = {
@@ -325,22 +332,62 @@
     none: "sem cotação", ok: "ok", unavailable: "API indisponível", circuit_open: "circuito aberto",
     refused: "recusada pela API", invalid_payload: "resposta inválida", restored_without_quote: "sessão restaurada"
   };
+  // Texto humano para TODOS os motivos de encaminhamento (H1-H14 + C1). Código desconhecido cai no fallback.
+  const HANDOFF_REASON = {
+    H1: "Você pediu para falar com uma pessoa.",
+    H2: "Sua mensagem indicou uma reclamação; o caso segue com prioridade.",
+    H3: "Esse assunto (sinistro, apólice, pagamento) é tratado por outro time.",
+    H4: "Não foi possível processar a mensagem com segurança.",
+    H5: "A API de cotação ficou indisponível.",
+    H6: "A API de cotação está instável (tentativas pausadas).",
+    H7: "A API de cotação recusou este perfil.",
+    H8: "Houve um erro ao montar a cotação.",
+    H9: "Uma verificação de segurança da resposta falhou.",
+    H10: "Os dados informados não puderam ser entendidos.",
+    H11: "Sem resposta ou sem progresso depois da cotação.",
+    H12: "Condições comerciais especiais exigem um especialista.",
+    H13: "Havia um dado ambíguo; um especialista vai confirmar com você.",
+    H14: "O atendimento foi encerrado por uma revisão de segurança.",
+    C1: "Você quer contratar: um especialista finaliza a contratação."
+  };
+  const HANDOFF_TITLE = { C1: "Contratação encaminhada", H14: "Atendimento encerrado" };
+  // Falhas de cotação ficam em destaque (não só em "Bastidores"). Nenhum valor é calculado em nenhum caso.
+  const QUOTE_ALERT = {
+    unavailable: "A API de cotação não respondeu. Nenhum valor foi calculado ou estimado.",
+    circuit_open: "A API de cotação está instável e as tentativas foram pausadas. Nenhum valor foi calculado ou estimado.",
+    invalid_payload: "O pedido de cotação foi rejeitado como inválido. Nenhum valor foi calculado.",
+    refused: "A API de cotação recusou este perfil (regra de negócio). Nenhum valor foi calculado.",
+    restored_without_quote: "Sessão retomada: a cotação anterior não foi guardada. Confirme os dados para cotar de novo."
+  };
+  const QUOTE_INFRA_FAILURE = new Set(["unavailable", "circuit_open", "invalid_payload"]);
 
   const $ = (id) => document.getElementById(id);
   const els = {
     messages: $("messages"), welcome: $("welcome"), form: $("form"), input: $("input"), send: $("send"),
     reset: $("reset"), status: $("status"), statusText: $("statusText"), steps: $("steps"),
-    slots: $("slots"), banner: $("banner"), tech: $("tech"), mStep: $("mStep"), mBar: $("mBar")
+    slots: $("slots"), banner: $("banner"), alert: $("alert"), tech: $("tech"), mStep: $("mStep"), mBar: $("mBar")
   };
 
+  // ---------------- identificadores (fallback quando crypto.randomUUID não existe: contexto não seguro/HTTP) ----------------
+  function newId() {
+    const c = globalThis.crypto;
+    if (c && typeof c.randomUUID === "function") return c.randomUUID();
+    if (c && typeof c.getRandomValues === "function") {
+      const b = new Uint8Array(16); c.getRandomValues(b);
+      return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    }
+    return (Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2))
+      .replace(/[^0-9a-f]/g, "").padEnd(16, "0").slice(0, 32);
+  }
+
   // ---------------- estado local (sessionStorage é só conveniência; falha silenciosa) ----------------
-  let state = load() || fresh();
+  let state = load();
+  if (!state || state.ended) { state = fresh(); save(); }   // R7: transcript de atendimento terminal não é reaproveitado
   let busy = false;
+  const rowsById = new Map();   // message_id -> linha (bolha) do usuário, só em memória
 
   function fresh() {
-    const rand = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2))
-      .replace(/[^A-Za-z0-9]/g, "").slice(0, 32);
-    return { sessionId: "web-" + rand, transcript: [], last: null };
+    return { sessionId: "web-" + newId().replace(/[^A-Za-z0-9]/g, "").slice(0, 32), transcript: [], last: null, ended: false };
   }
   function load() {
     try { const raw = sessionStorage.getItem(STORE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
@@ -351,7 +398,7 @@
 
   // ---------------- renderização ----------------
   function escapeHtml(s) {
-    return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
   // Formatação estilo WhatsApp (*negrito*, _itálico_) aplicada DEPOIS do escape.
   function formatText(s) {
@@ -397,9 +444,15 @@
   }
 
   function renderEntry(e) {
-    if (e.role === "user") return addRow("user", formatText(e.text), e.ts);
+    if (e.role === "user") { const row = addRow("user", formatText(e.text), e.ts); if (e.id) rowsById.set(e.id, row); return row; }
     if (e.role === "bot") return addRow("bot", formatText(e.text) + (e.quote ? quoteCard(e.quote) : ""), e.ts);
     if (e.role === "system") return addRow("system", escapeHtml(e.text));
+  }
+
+  function handoffBanner(h) {
+    const human = HANDOFF_REASON[h.reason] || "Seu atendimento foi encaminhado a um especialista.";
+    const title = HANDOFF_TITLE[h.reason] || "Encaminhado a um especialista";
+    return `<strong>${escapeHtml(title)}</strong>${escapeHtml(human)}<br><small>Fila <code>${escapeHtml(h.queue)}</code> · código <code>${escapeHtml(h.reason)}</code>${h.security_review ? " · revisão de segurança" : ""}</small>`;
   }
 
   function renderPanel(r) {
@@ -426,13 +479,23 @@
     }).join("");
 
     if (r && r.handoff) {
-      els.banner.innerHTML = `<strong>Encaminhado a um especialista</strong>Fila <code>${escapeHtml(r.handoff.queue)}</code> · motivo <code>${escapeHtml(r.handoff.reason)}</code>${r.handoff.security_review ? " · revisão de segurança" : ""}`;
+      els.banner.innerHTML = handoffBanner(r.handoff);
       els.banner.classList.remove("hidden");
     } else if (r && st === "ended") {
       els.banner.innerHTML = "<strong>Atendimento encerrado</strong>Clique em “Nova conversa” para recomeçar.";
       els.banner.classList.remove("hidden");
     } else {
       els.banner.classList.add("hidden");
+    }
+
+    const alertText = r && QUOTE_ALERT[r.quote_status];
+    if (alertText) {
+      const danger = r.quote_status !== "restored_without_quote";
+      els.alert.innerHTML = `<strong>${danger ? "Cotação não concluída" : "Atenção"}</strong>${escapeHtml(alertText)}`;
+      els.alert.classList.toggle("danger", danger);
+      els.alert.classList.remove("hidden");
+    } else {
+      els.alert.classList.add("hidden");
     }
 
     if (r) {
@@ -442,6 +505,7 @@
         ["quote_status", QUOTE_STATUS[r.quote_status] ? `${r.quote_status} (${QUOTE_STATUS[r.quote_status]})` : r.quote_status],
         ["codes", r.codes.length ? r.codes.join(", ") : "—"],
         ["latência", r._latency != null ? r._latency + " ms" : "—"],
+        ...(r._replay ? [["reenvio", "resposta reaproveitada (idempotente)"]] : []),
       ].map(([k, v]) => `<span>${k}: <code>${escapeHtml(String(v))}</code></span>`).join("");
     } else {
       els.tech.innerHTML = "<span>Nenhum turno ainda.</span>";
@@ -464,83 +528,135 @@
     return () => { clearTimeout(t); row.remove(); };
   }
 
+  // Sem /health publicado: o status vem do que o /chat devolveu (sucesso, erro de rede, 5xx, quote_status).
+  function setStatus(s, text) { els.status.dataset.s = s; els.statusText.textContent = text; }
+
   // ---------------- rede ----------------
-  async function sendMessage(text) {
-    text = text.trim();
-    if (!text || busy) return;
-    busy = true; updateSend();
+  // Um erro "recuperável" mostra Reenviar; o reenvio reutiliza o MESMO message_id (replay no servidor).
+  class SendError extends Error {
+    constructor(message, retryable) { super(message); this.retryable = retryable; }
+  }
 
-    const userEntry = { role: "user", text, ts: Date.now() };
-    state.transcript.push(userEntry); save();
-    renderEntry(userEntry);
-    els.input.value = ""; autosize();
+  function clearErrorRows() {
+    els.messages.querySelectorAll(".row.error").forEach((row) => {
+      const id = row.dataset.messageId;
+      const userRow = id && rowsById.get(id);
+      if (userRow && !userRow.querySelector(".unsent")) {
+        const meta = userRow.querySelector(".meta");
+        if (meta) meta.insertAdjacentHTML("beforeend", ' · <span class="unsent">não enviada</span>');
+      }
+      row.remove();
+    });
+  }
 
-    const stopTyping = showTyping();
+  async function post(entry) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-    const started = performance.now();
     try {
-      const res = await fetch(API_CHAT, {
+      return await fetch(API_CHAT, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ session_id: state.sessionId, message: text }),
+        body: JSON.stringify({ session_id: state.sessionId, message: entry.text, message_id: entry.id }),
         signal: ctrl.signal,
       });
-      if (res.status === 429) throw new Error("Muitas mensagens em pouco tempo. Aguarde alguns segundos e tente de novo.");
-      if (res.status === 422) throw new Error("Mensagem não aceita pela API (formato inválido).");
-      if (!res.ok) throw new Error(`O agente respondeu com erro (HTTP ${res.status}).`);
+    } finally { clearTimeout(timer); }
+  }
+
+  function describeFailure(err, res) {
+    if (err) {
+      if (err.name === "AbortError") { setStatus("degraded", "Resposta lenta"); return new SendError("O agente demorou demais para responder.", true); }
+      setStatus("down", "Agente offline");
+      return new SendError("Sem conexão com o agente.", true);
+    }
+    if (res.status === 429) return new SendError("Muitas mensagens em pouco tempo. Aguarde alguns segundos e reenvie.", true);
+    if (res.status === 413) return new SendError("Mensagem grande demais para ser enviada.", false);
+    if (res.status === 422) return new SendError("Mensagem não aceita pela API (formato inválido).", false);
+    if (res.status === 409) return new SendError("Conflito de identificador da mensagem. Envie de novo.", false);
+    setStatus("degraded", `Instável (HTTP ${res.status})`);
+    return new SendError(`O agente respondeu com erro (HTTP ${res.status}). Reenviar não duplica a mensagem.`, true);
+  }
+
+  // Entrega (ou re-entrega) de UMA mensagem já registrada no transcript. Nunca recria a bolha do usuário.
+  async function deliver(entry) {
+    if (busy) return;
+    busy = true; updateSend();
+    const stopTyping = showTyping();
+    const started = performance.now();
+    try {
+      let res;
+      for (let attempt = 0; ; attempt++) {
+        try { res = await post(entry); } catch (err) { throw describeFailure(err, null); }
+        if (res.status === 409 && attempt === 0) {   // mesmo id com outro texto: novo id e aviso (1 vez)
+          entry.id = newId(); save();
+          addRow("system", "Conflito de identificador da mensagem; reenviando com um novo identificador.");
+          continue;
+        }
+        break;
+      }
+      if (!res.ok) throw describeFailure(null, res);
       const data = await res.json();
       data._latency = Math.round(performance.now() - started);
+      data._replay = res.headers.get("X-Idempotent-Replay") === "true";
       stopTyping();
 
+      entry.status = "done";
       // O card de cotação só aparece no turno em que a cotação muda (evita repetir a cada mensagem).
-      const prevId = state.last && state.last.quote ? state.last.quote.quote_id + state.last.quote.plano_id : null;
+      const prev = state.last;
+      const prevId = prev && prev.quote ? prev.quote.quote_id + prev.quote.plano_id : null;
       const curId = data.quote ? data.quote.quote_id + data.quote.plano_id : null;
       const botEntry = { role: "bot", text: data.reply, ts: Date.now(), quote: curId && curId !== prevId ? data.quote : null };
       state.transcript.push(botEntry);
-      state.last = data; save();
+      state.last = data;
       renderEntry(botEntry);
+      if (QUOTE_ALERT[data.quote_status] && (!prev || prev.quote_status !== data.quote_status)) {
+        const bad = data.quote_status !== "restored_without_quote";
+        addRow("system alert", escapeHtml((bad ? "⚠ " : "") + QUOTE_ALERT[data.quote_status]));
+      }
+      setStatus(QUOTE_INFRA_FAILURE.has(data.quote_status) ? "degraded" : "ok",
+        QUOTE_INFRA_FAILURE.has(data.quote_status) ? "Cotação indisponível" : "Online");
       renderPanel(data);
+      if (data.state === "handoff" || data.state === "ended") {
+        // R7: após estado terminal o transcript não fica no navegador; a tela atual continua visível.
+        state = { sessionId: state.sessionId, transcript: [], last: null, ended: true };
+      }
+      save();
     } catch (err) {
       stopTyping();
-      const msg = err.name === "AbortError"
-        ? "O agente demorou demais para responder. Tente novamente."
-        : (err instanceof TypeError ? "Sem conexão com o agente." : err.message);
-      const row = addRow("error", escapeHtml(msg) + '<button class="btn retry" type="button">Reenviar</button>');
-      row.querySelector(".retry").addEventListener("click", () => {
-        row.remove();
-        state.transcript = state.transcript.filter((e) => e !== userEntry); save();
-        els.messages.lastElementChild?.classList.contains("user") && els.messages.lastElementChild.remove();
-        busy = false;
-        sendMessage(text);
+      const failure = err instanceof SendError ? err : new SendError("Erro inesperado ao enviar.", false);
+      if (!failure.retryable) { entry.status = "failed"; save(); }
+      const row = addRow("error", escapeHtml(failure.message) + (failure.retryable ? '<button class="btn retry" type="button">Reenviar</button>' : ""));
+      row.dataset.messageId = entry.id;
+      const btn = row.querySelector(".retry");
+      if (btn) btn.addEventListener("click", () => {
+        if (busy) return;          // nunca força busy=false nem dispara requisição concorrente
+        row.remove();              // só a linha de erro sai: a bolha do usuário e a ordem ficam intactas
+        deliver(entry);            // mesmo message_id
       }, { once: true });
     } finally {
-      clearTimeout(timer);
       busy = false; updateSend();
       if (!els.input.disabled) els.input.focus({ preventScroll: true });
     }
   }
 
-  async function checkHealth() {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 5000);
-      const res = await fetch(API_HEALTH, { signal: ctrl.signal, cache: "no-store" });
-      clearTimeout(t);
-      if (!res.ok) throw new Error();
-      const h = await res.json();
-      const breaker = h.quote_client && h.quote_client.breaker_state;
-      const reachable = !h.quote_service || h.quote_service.reachable;
-      if (h.status === "ok" && reachable && breaker !== "open") {
-        setStatus("ok", `Online · v${h.version}`);
-      } else {
-        setStatus("degraded", !reachable ? "API de cotação fora" : "Circuito aberto");
-      }
-    } catch {
-      setStatus("down", "Agente offline");
+  async function sendMessage(text) {
+    text = text.trim();
+    if (!text || busy) return;
+    clearErrorRows();   // um "Reenviar" antigo não pode reordenar nem duplicar bolhas depois de uma nova mensagem
+    const entry = { role: "user", id: newId(), text, ts: Date.now(), status: "pending" };
+    state.transcript.push(entry); save();
+    renderEntry(entry);
+    els.input.value = ""; autosize();
+    await deliver(entry);
+  }
+
+  // R5: recarregou com uma mensagem sem resposta -> reenvia com o MESMO message_id (replay, sem duplicar).
+  function resumePending() {
+    const last = state.transcript[state.transcript.length - 1];
+    if (last && last.role === "user" && last.status === "pending" && last.id) {
+      addRow("system", "Retomando o envio da sua última mensagem…");
+      deliver(last);
     }
   }
-  function setStatus(s, text) { els.status.dataset.s = s; els.statusText.textContent = text; }
 
   // ---------------- eventos ----------------
   function autosize() {
@@ -559,8 +675,10 @@
   els.reset.addEventListener("click", () => {
     if (busy) return;
     state = fresh(); save();
+    rowsById.clear();
     els.messages.querySelectorAll(".row").forEach((r) => r.remove());
     els.welcome.classList.remove("hidden");
+    setStatus("unknown", "Status desconhecido");
     renderPanel(null);
     els.input.focus();
   });
@@ -568,8 +686,8 @@
   // ---------------- boot ----------------
   state.transcript.forEach(renderEntry);
   renderPanel(state.last);
-  checkHealth();
-  setInterval(checkHealth, 30000);
+  setStatus("unknown", "Status desconhecido");
+  resumePending();
 })();
 </script>
 </body>
