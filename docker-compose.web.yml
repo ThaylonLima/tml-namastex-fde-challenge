@@ -1,0 +1,22 @@
+# Extra opcional (fora do escopo avaliado): frontend de chat + proxy reverso para o agente.
+# Não altera nenhum serviço do docker-compose.yml oficial; só adiciona o serviço "web".
+#
+#   docker compose -f docker-compose.yml -f docker-compose.web.yml up -d --build
+#
+# A porta fica presa ao loopback: o acesso público passa pelo Cloudflare Tunnel.
+services:
+  web:
+    image: nginx:1.27-alpine
+    depends_on:
+      - agent
+    ports:
+      - "127.0.0.1:8090:80"
+    volumes:
+      - ./web/index.html:/usr/share/nginx/html/index.html:ro
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/autoseguro/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+    restart: unless-stopped
