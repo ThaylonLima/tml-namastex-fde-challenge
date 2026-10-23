@@ -1,6 +1,6 @@
 # Log de Execução Completa (entregável #4)
 
-Gerado em 2026-10-21 20:33 UTC · commit base `8596a49` · Python 3.12.3 · quote-service com taxas padrão (falha 20%, lentidão 10% × 8 s) e `QUOTE_SEED=1`.
+Gerado em 2026-10-23 22:28 UTC · commit base `4827641` · Python 3.12.3 · quote-service com taxas padrão (falha 20%, lentidão 10% × 8 s) e `QUOTE_SEED=1`.
 
 Dados do lead **fictícios**. O relatório mostra as mensagens do lead **como o agente as armazena** (mascaradas pela função de produção `mask_text`); o bruto fictício só aparece na tabela da seção 2.
 
@@ -45,20 +45,20 @@ estado=`confirming` · códigos=`CONFIRM` · turn_id=`c_37bc46846e7ba697e40e:4`
 > • Carência de 30 dias para roubo e furto, contada a partir do início da vigência
 > Posso tirar alguma dúvida sobre a cotação ou, se preferir, seguir para a contratação.
 
-estado=`presenting` · códigos=`QUOTE_OK` · turn_id=`c_37bc46846e7ba697e40e:5` · quote_id=`59aa2b2525194d43875956d5df997204`
+estado=`presenting` · códigos=`QUOTE_OK` · turn_id=`c_37bc46846e7ba697e40e:5` · quote_id=`1cd6e52a136a4f6781984b894ae34050`
 
 **lead** (como armazenado, mascarado): `vamos nessa, quero contratar!`
 
 > Ótimo! Vou encaminhar você a um especialista para finalizar a contratação.
 
-estado=`ended` · códigos=`HANDOFF_C1` · turn_id=`c_37bc46846e7ba697e40e:6` · quote_id=`59aa2b2525194d43875956d5df997204` · **handoff C1** fila=`default` security_review=False
+estado=`ended` · códigos=`HANDOFF_C1` · turn_id=`c_37bc46846e7ba697e40e:6` · quote_id=`1cd6e52a136a4f6781984b894ae34050` · **handoff C1** fila=`default` security_review=False
 
 #### Rastro da chamada ao `/quote` (retry, lentidão e breaker)
 
 | turno | request_id | tentativa | resultado | latência | breaker |
 |---|---|---|---|---|---|
-| 5 | `c_37bc46846e7ba697e40e-5` | 1 | `http_500` (HTTP 500) | 8 ms | closed |
-| 5 | `c_37bc46846e7ba697e40e-5` | 2 | `ok` (HTTP 200) | 8005 ms | closed |
+| 5 | `c_37bc46846e7ba697e40e-5` | 1 | `http_500` (HTTP 500) | 7 ms | closed |
+| 5 | `c_37bc46846e7ba697e40e-5` | 2 | `ok` (HTTP 200) | 8006 ms | closed |
 
 Leitura: a 1ª tentativa recebeu **HTTP 500** do legado; o cliente aplicou backoff com jitter e a 2ª tentativa foi a **resposta lenta de 8 s**, absorvida pelo timeout de 10 s (sem abortar) e devolvida com HTTP 200. O lead nunca viu erro nem preço inventado.
 
@@ -158,7 +158,7 @@ estado=`handoff` · códigos=`HANDOFF_H14` · turn_id=`c_9d9898dd48cb7c2f5e3a:4`
 | Resultado por tentativa | `http_500`=3, `http_502`=2, `ok`=17, `refused`=5 |
 | Operações que precisaram de retry e **mesmo assim** cotaram | 5 de 5 |
 | Respostas lentas (≥ 7 s) absorvidas com HTTP 200 | 2 |
-| Latência por tentativa: mediana / p95 / máx | 58 / 75 / 8056 ms |
+| Latência por tentativa: mediana / p95 / máx | 56 / 67 / 8058 ms |
 | Desfecho das conversas de carga | `H7`=4, `presenting`=16 |
 
 `H7` = recusa 422 legítima da API (idade > 75 ou veículo com mais de 20 anos); `H5` apareceria se os 3 retries falhassem; o circuit breaker não abre por ruído de base (conta falhas por operação).
