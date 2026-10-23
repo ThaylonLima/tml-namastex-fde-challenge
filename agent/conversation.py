@@ -22,8 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import hmac
 import logging
+import secrets
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -70,6 +74,7 @@ HISTORY_LIMIT: Final = 5
 MAX_LLM_REPLY_CHARS: Final = 900
 FOLLOWUP_AFTER_SECONDS: Final = 900.0
 MAX_FOLLOWUPS: Final = 2
+IDEMPOTENCY_WINDOW: Final = 50  # ultimos message_id lembrados por sessao
 
 
 class QuoteProvider(Protocol):
@@ -119,6 +124,8 @@ class Session:
     last_activity: float = 0.0
     followups_sent: int = 0
     pending_notice: str = ""  # aviso unico exibido no proximo turno (ex.: sessao restaurada)
+    # cache de idempotencia: SO memoria, nunca em to_record(); some junto com a sessao
+    idem: OrderedDict[str, _IdemEntry] = field(default_factory=OrderedDict)
 
     def to_record(self) -> dict[str, Any]:
         """Registro persistivel/logavel: nenhum campo volatil (CEP completo, nomes, texto cru)."""
@@ -199,6 +206,18 @@ class AgentReply:
     handoff: HandoffPackage | None = None
     security_review: bool = False
     codes: tuple[str, ...] = ()
+    snapshot: Any = None  # resposta completa montada DENTRO do lock (ver Agent.handle_message)
+    replay: bool = False  # True quando veio do cache de idempotencia
+
+
+@dataclass(frozen=True, slots=True)
+class _IdemEntry:
+    text_mac: bytes  # HMAC da mensagem (chave aleatoria do processo): o texto cru nunca e guardado
+    reply: AgentReply  # inclui o snapshot completo da resposta original
+
+
+class IdempotencyConflict(Exception):  # noqa: N818
+    """Mesmo message_id com mensagem diferente. Nao carrega nenhum conteudo."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,12 +252,30 @@ class Agent:
         self._max_stagnant = max_stagnant_turns
         self.sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._idem_key = secrets.token_bytes(32)
 
     # ---------------------------------------------------------------- API publica
     async def handle_message(
-        self, conversation_id: str, raw_text: str, *, sender_name: str | None = None
+        self,
+        conversation_id: str,
+        raw_text: str,
+        *,
+        sender_name: str | None = None,
+        message_id: str | None = None,
+        snapshot: Callable[[Session, AgentReply], Any] | None = None,
     ) -> AgentReply:
+        """Processa um turno. Com `message_id`, o turno e idempotente.
+
+        Ordem dentro do lock da sessao: (1) consulta de replay, ANTES de qualquer mutacao;
+        (2) turno normal; (3) `snapshot(session, reply)` ainda DENTRO do lock, e so entao o
+        resultado e lembrado. Replay devolve o snapshot original (`reply.replay=True`), sem
+        tocar na sessao. Sem `message_id` o comportamento e o de sempre.
+        """
         async with self._locks.setdefault(conversation_id, asyncio.Lock()):  # 1 turno por vez
+            if message_id is not None:
+                replayed = self._replay(conversation_id, message_id, raw_text)
+                if replayed is not None:
+                    return replayed
             started = time.monotonic()
             session = self._session(conversation_id)
             if sender_name:
@@ -253,7 +290,49 @@ class Agent:
                 reply = dataclasses.replace(reply, text=f"{notice} {reply.text}")
             self._persist(session)
             self._log(session, before, reply, round((time.monotonic() - started) * 1000))
+            if snapshot is not None:
+                reply = dataclasses.replace(reply, snapshot=snapshot(session, reply))
+            if message_id is not None:
+                self._remember(session, message_id, raw_text, reply)
             return reply
+
+    # ---------------------------------------------------------------- idempotencia
+    def _mac(self, text: str) -> bytes:
+        return hmac.new(self._idem_key, text.encode(), hashlib.sha256).digest()
+
+    @staticmethod
+    def _message_ref(message_id: str) -> str:
+        return hashlib.sha256(message_id.encode()).hexdigest()[:8]  # nunca o id cru no log
+
+    def _replay(self, conversation_id: str, message_id: str, raw_text: str) -> AgentReply | None:
+        session = self.sessions.get(conversation_id)  # so memoria: nao cria nem restaura
+        entry = session.idem.get(message_id) if session is not None else None
+        if session is None or entry is None:
+            return None
+        ref = self._message_ref(message_id)
+        if not hmac.compare_digest(entry.text_mac, self._mac(raw_text)):
+            logger.warning(
+                "chat_idempotency_conflict",
+                extra={"conversation_id": conversation_id, "message_ref": ref},
+            )
+            raise IdempotencyConflict
+        logger.info(
+            "chat_replay",
+            extra={
+                "conversation_id": conversation_id,
+                "message_ref": ref,
+                "turn": session.turn,
+                "state_to": session.state.value,
+            },
+        )
+        return dataclasses.replace(entry.reply, replay=True)
+
+    def _remember(
+        self, session: Session, message_id: str, raw_text: str, reply: AgentReply
+    ) -> None:
+        session.idem[message_id] = _IdemEntry(self._mac(raw_text), reply)
+        while len(session.idem) > IDEMPOTENCY_WINDOW:
+            session.idem.popitem(last=False)
 
     def get_session(self, conversation_id: str) -> Session | None:
         if conversation_id in self.sessions:

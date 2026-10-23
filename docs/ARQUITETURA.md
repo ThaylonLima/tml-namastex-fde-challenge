@@ -499,7 +499,7 @@ hora e 3 reenvios de uma resposta vaga viram H10.
 |---|---|
 | Contrato | `message_id` **opcional** no `ChatRequest`, padrão `^[A-Za-z0-9_-]{8,64}$`. Sem ele, comportamento idêntico ao atual. Versão da API sobe para **0.5.0** |
 | Onde | Dentro do **lock da sessão**, como **primeira operação** — antes de qualquer mutação (`turn`, `followups_sent`, `last_activity`, consumo de `pending_notice`, `_persist`). Só consulta a sessão **já em memória** (não cria nem restaura) |
-| Snapshot | O `ChatResponse` completo (sem o eco do `session_id`) é calculado **dentro do lock** e gravado no cache antes de liberar. Replay devolve o snapshot, nunca reconstrói a partir do estado atual. Para isso a montagem da resposta saiu de `app.py`, que a fazia depois do lock, e virou um callback executado pelo agente (`Agent.handle_turn`) |
+| Snapshot | O `ChatResponse` completo (sem o eco do `session_id`) é calculado **dentro do lock** e gravado no cache antes de liberar. Replay devolve o snapshot, nunca reconstrói a partir do estado atual. Para isso a montagem da resposta saiu de `app.py`, que a fazia depois do lock, e virou um callback (`snapshot`) executado pelo agente dentro de `Agent.handle_message(…, message_id, snapshot)` |
 | Replay | Mesmo `message_id` + mesma mensagem ⇒ corpo **idêntico**, header `X-Idempotent-Replay: true`. Nada é persistido nem alterado; gera o evento de log `chat_replay` (sem PII) |
 | Conflito | Mesmo `message_id` + mensagem diferente ⇒ **HTTP 409**, sem processar. A comparação usa **HMAC-SHA256 com chave aleatória do processo**; o texto cru **nunca** é guardado no cache (LGPD) |
 | Cache | Só respostas 200. Janela: últimos **50** ids por sessão. Somente memória, vive no objeto `Session` (não entra em `to_record()`), logo some junto com a sessão |
@@ -523,7 +523,7 @@ memória — nem por TTL, nem por teto. Motivo: a restauração do SQLite descar
 | Teto `SESSION_MAX_IN_MEMORY` (padrão 10 000) | ao inserir uma sessão nova: descarta terminais (mais antigas primeiro), depois não terminais sem cotação (mais antigas primeiro); nunca as protegidas. **Se só restarem protegidas, a sessão nova é aceita** e é registrado um alerta (`session_cap_protected_only`): recusar um lead com cotação seria pior |
 | Em andamento | nunca remover sessão com lock adquirido **ou** com turno aguardando o lock (contador `in-flight`); a checagem e a remoção são síncronas, **sem `await` entre elas** |
 
-- **Gatilho (sem dependência nova):** varredura **oportunista** — a cada `handle_turn`, no máximo a cada
+- **Gatilho (sem dependência nova):** varredura **oportunista** — a cada `handle_message`, no máximo a cada
   30 s, examina um lote limitado (64 sessões, cursor rotativo); e uma passada completa em `sweep_idle()`.
   Escolhida em vez de uma tarefa no `lifespan` porque funciona igual sob `ASGITransport`/CLI (que não executam
   o lifespan), usa o relógio injetável e é determinística nos testes; sem tráfego não há crescimento a conter.

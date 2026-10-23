@@ -18,7 +18,7 @@ ALLOWED_FIELDS: Final = frozenset(
         "conversation_id", "session_ref", "turn", "turn_id", "request_id", "attempt", "status",
         "latency_ms", "outcome", "breaker_state", "state_from", "state_to", "codes",
         "security_strikes", "slots_filled", "quote_status", "quote_id", "handoff_reason", "kind",
-        "method", "path", "http_status", "error_type", "scenario",
+        "method", "path", "http_status", "error_type", "scenario", "message_ref",
     }
 )  # fmt: skip
 _MAX_STR: Final = 120

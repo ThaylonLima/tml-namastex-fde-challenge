@@ -29,7 +29,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Reques
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agent.conversation import Agent, AgentReply, IdleAction, Session
+from agent.conversation import (
+    Agent,
+    AgentReply,
+    IdempotencyConflict,
+    IdleAction,
+    Session,
+)
 from agent.llm import LLMAdapter, llm_from_env
 from agent.logging_setup import configure_logging
 from agent.quote_client import Quote, QuoteClient, QuoteClientConfig
@@ -37,8 +43,10 @@ from agent.settings import DEFAULT_SALT, Settings
 from agent.store import SessionStore, SqliteSessionStore
 
 logger = logging.getLogger("agent.app")
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SESSION_ID_PATTERN = r"^[A-Za-z0-9_.:@+-]{1,64}$"
+MESSAGE_ID_PATTERN = r"^[A-Za-z0-9_-]{8,64}$"
+REPLAY_HEADER = "X-Idempotent-Replay"
 
 
 def pseudonymize(session_id: str, salt: str) -> str:
@@ -54,6 +62,8 @@ class ChatRequest(BaseModel):
     session_id: str = Field(pattern=SESSION_ID_PATTERN)
     message: str = Field(min_length=1, max_length=10_000)
     sender_name: str | None = Field(default=None, max_length=100)
+    # idempotencia opcional: mesmo id + mesma mensagem => replay; mesmo id + outra mensagem => 409
+    message_id: str | None = Field(default=None, pattern=MESSAGE_ID_PATTERN)
 
     @field_validator("message")
     @classmethod
@@ -126,10 +136,12 @@ def _public_quote(quote: Quote | None) -> PublicQuote | None:
     )
 
 
-def _chat_response(session_id: str, session: Session, reply: AgentReply) -> ChatResponse:
+def _chat_payload(session: Session, reply: AgentReply) -> dict[str, Any]:
+    """Resposta COMPLETA do turno, sem o eco do `session_id`. Montada pelo agente dentro do lock
+    da sessao (snapshot) para que um replay devolva exatamente o corpo original."""
     handoff = reply.handoff
-    return ChatResponse(
-        session_id=session_id,
+    payload = ChatResponse(
+        session_id="",
         turn_id=f"{session.conversation_id}:{session.turn}",
         reply=reply.text,
         state=reply.state.value,
@@ -147,6 +159,7 @@ def _chat_response(session_id: str, session: Session, reply: AgentReply) -> Chat
         if handoff
         else None,
     )
+    return payload.model_dump(mode="json", exclude={"session_id"})
 
 
 # --------------------------------------------------------------------------- fabrica
@@ -321,13 +334,20 @@ def create_app(
         return body
 
     @app.post("/chat", response_model=ChatResponse)
-    async def chat(req: ChatRequest) -> ChatResponse:
-        conversation_id = ref(req.session_id)
-        reply = await res.agent.handle_message(
-            conversation_id, req.message, sender_name=req.sender_name
-        )
-        session = res.agent.sessions[conversation_id]
-        return _chat_response(req.session_id, session, reply)
+    async def chat(req: ChatRequest, response: Response) -> ChatResponse:
+        try:
+            reply = await res.agent.handle_message(
+                ref(req.session_id),
+                req.message,
+                sender_name=req.sender_name,
+                message_id=req.message_id,
+                snapshot=_chat_payload,
+            )
+        except IdempotencyConflict:
+            raise HTTPException(status_code=409, detail="idempotency_conflict") from None
+        if reply.replay:
+            response.headers[REPLAY_HEADER] = "true"
+        return ChatResponse.model_validate({"session_id": req.session_id, **reply.snapshot})
 
     @app.get("/sessions/{session_id}", dependencies=[Depends(require_admin)])
     async def get_session(
