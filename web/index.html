@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AutoSeguro · Cotação</title>
+<meta name="description" content="Demonstração do agente de cotação de seguro auto AutoSeguro (desafio FDE Namastex).">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f766e'/%3E%3Cpath d='M16 6l8 3v6c0 5-3.4 9.2-8 11-4.6-1.8-8-6-8-11V9z' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f4f5f2;
+    --surface: #ffffff;
+    --surface-2: #eef0ec;
+    --text: #17201d;
+    --muted: #5d6965;
+    --line: #dde1dc;
+    --accent: #0f766e;
+    --accent-ink: #ffffff;
+    --accent-soft: #d8efea;
+    --user: #0f766e;
+    --user-ink: #ffffff;
+    --warn: #9a5b00;
+    --warn-soft: #fbefd9;
+    --danger: #b42318;
+    --ok: #138a4a;
+    --radius: 18px;
+    --shadow: 0 1px 2px rgba(16, 24, 20, .06), 0 8px 24px rgba(16, 24, 20, .06);
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1211;
+      --surface: #151c1a;
+      --surface-2: #1d2624;
+      --text: #e7ece9;
+      --muted: #94a19c;
+      --line: #263130;
+      --accent: #2dd4bf;
+      --accent-ink: #062521;
+      --accent-soft: #123a35;
+      --user: #1f8f84;
+      --user-ink: #ffffff;
+      --warn: #f5b84a;
+      --warn-soft: #33270f;
+      --danger: #f97066;
+      --ok: #47cd89;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, textarea { font: inherit; color: inherit; }
+
+  .app {
+    height: 100dvh;
+    max-width: 1120px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 0 20px;
+    padding: 0 16px;
+  }
+
+  /* ---------- topo ---------- */
+  header {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo {
+    width: 36px; height: 36px; border-radius: 10px; flex: none;
+    background: var(--accent); display: grid; place-items: center;
+  }
+  .logo svg { width: 20px; height: 20px; fill: var(--accent-ink); }
+  .brand h1 { font-size: 16px; margin: 0; letter-spacing: -.01em; }
+  .brand p { margin: 0; font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .spacer { flex: 1; }
+  .status {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12.5px; color: var(--muted);
+    padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+    white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .status[data-s="ok"] .dot { background: var(--ok); }
+  .status[data-s="degraded"] .dot { background: var(--warn); }
+  .status[data-s="down"] .dot { background: var(--danger); }
+  .btn {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 10px;
+    padding: 7px 12px; cursor: pointer; font-size: 13.5px; white-space: nowrap;
+  }
+  .btn:hover { background: var(--surface-2); }
+  .btn:focus-visible, .send:focus-visible, .chip:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  /* ---------- chat ---------- */
+  .chat { display: flex; flex-direction: column; min-height: 0; }
+  .messages {
+    flex: 1; overflow-y: auto; padding: 20px 2px 12px;
+    display: flex; flex-direction: column; gap: 10px;
+    scroll-behavior: smooth;
+  }
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: min(78%, 560px);
+    padding: 10px 14px; border-radius: var(--radius);
+    background: var(--surface); border: 1px solid var(--line);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    animation: rise .18s ease-out;
+  }
+  .row.bot .bubble { border-bottom-left-radius: 6px; }
+  .row.user .bubble {
+    background: var(--user); color: var(--user-ink); border-color: transparent;
+    border-bottom-right-radius: 6px;
+  }
+  .row.system .bubble {
+    max-width: 100%; margin: 4px auto; text-align: center;
+    background: transparent; border: none; color: var(--muted); font-size: 13px; padding: 2px 8px;
+  }
+  .row.error .bubble {
+    background: var(--warn-soft); border-color: transparent; color: var(--text); font-size: 14px;
+  }
+  .row.error .retry { margin-top: 6px; display: block; }
+  .meta { display: block; margin-top: 4px; font-size: 11px; opacity: .65; text-align: right; }
+  @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+  .typing .bubble { display: inline-flex; gap: 4px; align-items: center; padding: 14px 16px; }
+  .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+  .typing span:nth-child(2) { animation-delay: .15s; }
+  .typing span:nth-child(3) { animation-delay: .3s; }
+  .typing em { font-style: normal; font-size: 12.5px; color: var(--muted); margin-left: 6px; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+
+  .quote {
+    margin-top: 8px; padding: 12px; border-radius: 12px;
+    background: var(--accent-soft); border: 1px solid var(--line);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; white-space: normal;
+  }
+  .quote h3 { grid-column: 1 / -1; margin: 0; font-size: 14px; }
+  .quote dt { font-size: 11.5px; color: var(--muted); }
+  .quote dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .welcome {
+    margin: auto 0; padding: 24px 4px; text-align: center; color: var(--muted);
+  }
+  .welcome h2 { color: var(--text); font-size: 20px; margin: 0 0 6px; letter-spacing: -.01em; }
+  .welcome p { margin: 0 auto 16px; max-width: 420px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .chip {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 999px;
+    padding: 7px 13px; cursor: pointer; font-size: 13.5px;
+  }
+  .chip:hover { border-color: var(--accent); }
+
+  .composer {
+    display: flex; gap: 8px; align-items: flex-end;
+    padding: 10px 0 max(14px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+  }
+  textarea {
+    flex: 1; resize: none; max-height: 140px; min-height: 46px;
+    padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line);
+    background: var(--surface); line-height: 1.4;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  textarea:disabled { opacity: .6; }
+  .send {
+    width: 46px; height: 46px; flex: none; border-radius: 14px; border: none; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink); display: grid; place-items: center;
+  }
+  .send:disabled { opacity: .45; cursor: not-allowed; }
+  .send svg { width: 20px; height: 20px; fill: currentColor; }
+  .hint { font-size: 11.5px; color: var(--muted); text-align: center; padding-bottom: 8px; margin-top: -6px; }
+
+  /* ---------- painel lateral ---------- */
+  aside {
+    padding: 20px 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; box-shadow: var(--shadow);
+  }
+  .card h2 {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); margin: 0 0 10px; font-weight: 600;
+  }
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+  .steps li { display: flex; align-items: center; gap: 10px; padding: 5px 0; color: var(--muted); font-size: 14px; }
+  .steps li::before {
+    content: ""; width: 10px; height: 10px; border-radius: 50%; flex: none;
+    border: 2px solid var(--line); background: var(--surface);
+  }
+  .steps li.done { color: var(--text); }
+  .steps li.done::before { background: var(--accent); border-color: var(--accent); }
+  .steps li.current { color: var(--text); font-weight: 600; }
+  .steps li.current::before { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .slots { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0; font-size: 14px; }
+  .slots dt { color: var(--muted); }
+  .slots dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .slots dd.empty { color: var(--muted); opacity: .6; }
+  .banner { border-radius: 12px; padding: 12px 14px; font-size: 13.5px; background: var(--warn-soft); }
+  .banner strong { display: block; margin-bottom: 2px; }
+  .tech { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+  .tech code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--text); }
+  .note { font-size: 12px; color: var(--muted); margin: 0; }
+  .hidden { display: none !important; }
+
+  @media (max-width: 860px) {
+    .app { grid-template-columns: minmax(0, 1fr); padding: 0 12px; }
+    aside { display: none; }
+    .brand p { display: none; }
+    .brand h1 { white-space: nowrap; }
+    #statusText { display: none; }
+    .status { padding: 8px; }
+    .reset-long { display: none; }
+    .mobile-progress { display: flex !important; }
+  }
+  .mobile-progress {
+    display: none; gap: 6px; align-items: center; padding: 8px 0 0; font-size: 12px; color: var(--muted);
+  }
+  .mobile-progress .bar { flex: 1; height: 4px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
+  .mobile-progress .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2l8 3v6.2c0 5.1-3.4 9.4-8 10.8-4.6-1.4-8-5.7-8-10.8V5z"/></svg></div>
+      <div>
+        <h1>AutoSeguro</h1>
+        <p>Agente de cotação de seguro auto · FSM determinística + API legada</p>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <span class="status" id="status" data-s="unknown" title="Saúde do agente (GET /health)"><span class="dot"></span><span id="statusText">Verificando…</span></span>
+    <button class="btn" id="reset" type="button" aria-label="Nova conversa">Nova<span class="reset-long"> conversa</span></button>
+  </header>
+
+  <main class="chat">
+    <div class="mobile-progress" aria-hidden="true"><span id="mStep">Início</span><div class="bar"><i id="mBar"></i></div></div>
+    <div class="messages" id="messages" role="log" aria-live="polite" aria-label="Conversa">
+      <div class="welcome" id="welcome">
+        <h2>Cote seu seguro auto em poucos passos</h2>
+        <p>Converse como no WhatsApp. O agente coleta idade, ano do veículo, CEP e plano, confirma os dados e consulta o preço na API oficial.</p>
+        <div class="chips">
+          <button class="chip" type="button" data-msg="Oi, quero cotar um seguro para o meu carro">Quero cotar meu carro</button>
+          <button class="chip" type="button" data-msg="Tenho 35 anos, carro 2020, CEP 01310-100, plano completo">Mandar tudo de uma vez</button>
+          <button class="chip" type="button" data-msg="Qual a diferença entre os planos?">Diferença entre planos</button>
+        </div>
+      </div>
+    </div>
+    <form class="composer" id="form" autocomplete="off">
+      <textarea id="input" rows="1" maxlength="2000" placeholder="Digite sua mensagem…" aria-label="Mensagem"></textarea>
+      <button class="send" id="send" type="submit" aria-label="Enviar" disabled>
+        <svg viewBox="0 0 24 24"><path d="M3.4 20.4l17.4-7.5c.8-.4.8-1.5 0-1.8L3.4 3.6c-.7-.3-1.4.3-1.2 1l1.7 6.2 9.1 1.2-9.1 1.2-1.7 6.2c-.2.7.5 1.3 1.2 1z"/></svg>
+      </button>
+    </form>
+    <div class="hint">Demonstração pública — não envie dados pessoais reais (CPF, telefone, e-mail).</div>
+  </main>
+
+  <aside aria-label="Estado do atendimento">
+    <section class="card">
+      <h2>Etapa</h2>
+      <ol class="steps" id="steps">
+        <li data-k="greeting">Boas-vindas</li>
+        <li data-k="qualifying">Coleta de dados</li>
+        <li data-k="confirming">Confirmação</li>
+        <li data-k="quoting">Cotação na API</li>
+        <li data-k="presenting">Proposta</li>
+        <li data-k="closing">Contratação</li>
+      </ol>
+    </section>
+    <section class="card">
+      <h2>Dados coletados</h2>
+      <dl class="slots" id="slots"></dl>
+    </section>
+    <div class="banner hidden" id="banner"></div>
+    <section class="card">
+      <h2>Bastidores</h2>
+      <div class="tech" id="tech"><span>Nenhum turno ainda.</span></div>
+    </section>
+    <p class="note">O CEP aparece só pelo prefixo: o agente nunca expõe nem persiste o CEP completo. Valores monetários vêm exclusivamente da API legada.</p>
+  </aside>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // Caminhos relativos: funciona em /autoseguro/ (via proxy) sem configuração extra.
+  const API_CHAT = "api/chat";
+  const API_HEALTH = "api/health?deep=true";
+  const REQUEST_TIMEOUT_MS = 45000;   // a quote-api simula lentidão (8s) e retentativas
+  const STORE_KEY = "autoseguro.chat.v1";
+
+  const STATE_ORDER = ["greeting", "qualifying", "confirming", "quoting", "presenting", "closing"];
+  const STATE_LABEL = {
+    greeting: "Boas-vindas", qualifying: "Coleta de dados", confirming: "Confirmação",
+    quoting: "Cotação na API", presenting: "Proposta", closing: "Contratação",
+    handoff: "Com especialista", ended: "Encerrado"
+  };
+  const SLOT_LABEL = [
+    ["idade", "Idade"], ["veiculo_ano", "Ano do veículo"], ["cep_prefix", "CEP"],
+    ["plano_id", "Plano"], ["data_inicio", "Início"]
+  ];
+  const PLAN_LABEL = { essencial: "Essencial", completo: "Completo", premium: "Premium" };
+  const QUOTE_STATUS = {
+    none: "sem cotação", ok: "ok", unavailable: "API indisponível", circuit_open: "circuito aberto",
+    refused: "recusada pela API", invalid_payload: "resposta inválida", restored_without_quote: "sessão restaurada"
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    messages: $("messages"), welcome: $("welcome"), form: $("form"), input: $("input"), send: $("send"),
+    reset: $("reset"), status: $("status"), statusText: $("statusText"), steps: $("steps"),
+    slots: $("slots"), banner: $("banner"), tech: $("tech"), mStep: $("mStep"), mBar: $("mBar")
+  };
+
+  // ---------------- estado local (sessionStorage é só conveniência; falha silenciosa) ----------------
+  let state = load() || fresh();
+  let busy = false;
+
+  function fresh() {
+    const rand = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2))
+      .replace(/[^A-Za-z0-9]/g, "").slice(0, 32);
+    return { sessionId: "web-" + rand, transcript: [], last: null };
+  }
+  function load() {
+    try { const raw = sessionStorage.getItem(STORE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+  }
+  function save() {
+    try { sessionStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* modo privado etc. */ }
+  }
+
+  // ---------------- renderização ----------------
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+  // Formatação estilo WhatsApp (*negrito*, _itálico_) aplicada DEPOIS do escape.
+  function formatText(s) {
+    return escapeHtml(s)
+      .replace(/\*([^*\n]+)\*/g, "<strong>$1</strong>")
+      .replace(/(^|\s)_([^_\n]+)_(?=\s|$|[.,!?])/g, "$1<em>$2</em>");
+  }
+  // Mesma regra de format_brl do agente: só formatação da string Decimal, nenhum cálculo.
+  function brl(decimalStr) {
+    if (decimalStr == null) return "—";
+    const m = /^(-?)(\d+)(?:\.(\d+))?$/.exec(String(decimalStr));
+    if (!m) return escapeHtml(String(decimalStr));
+    const frac = ((m[3] || "") + "00").slice(0, 2);
+    const whole = m[2].replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+    return "R$ " + m[1] + whole + "," + frac;
+  }
+  function time(ts) {
+    return new Date(ts).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function addRow(kind, html, ts) {
+    els.welcome.classList.add("hidden");
+    const row = document.createElement("div");
+    row.className = "row " + kind;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.innerHTML = html + (ts && (kind === "bot" || kind === "user") ? `<span class="meta">${time(ts)}</span>` : "");
+    row.appendChild(bubble);
+    els.messages.appendChild(row);
+    els.messages.scrollTop = els.messages.scrollHeight;
+    return row;
+  }
+
+  function quoteCard(q) {
+    if (!q) return "";
+    return `<dl class="quote">
+      <h3>${escapeHtml(q.plano_nome)}</h3>
+      <div><dt>Prêmio mensal</dt><dd>${brl(q.premio_mensal)}</dd></div>
+      <div><dt>Franquia</dt><dd>${brl(q.franquia)}</dd></div>
+      <div><dt>Carência</dt><dd>${Number(q.carencia_dias)} dias</dd></div>
+      <div><dt>1º pagamento</dt><dd>${q.primeiro_pagamento ? brl(q.primeiro_pagamento) : "—"}</dd></div>
+    </dl>`;
+  }
+
+  function renderEntry(e) {
+    if (e.role === "user") return addRow("user", formatText(e.text), e.ts);
+    if (e.role === "bot") return addRow("bot", formatText(e.text) + (e.quote ? quoteCard(e.quote) : ""), e.ts);
+    if (e.role === "system") return addRow("system", escapeHtml(e.text));
+  }
+
+  function renderPanel(r) {
+    const st = r ? r.state : "greeting";
+    const idx = STATE_ORDER.indexOf(st);
+    const terminal = st === "handoff" || st === "ended";
+    els.steps.querySelectorAll("li").forEach((li, i) => {
+      li.classList.toggle("done", !terminal && i < idx || (st === "ended" && !r?.handoff));
+      li.classList.toggle("current", !terminal && i === idx && !!r);
+    });
+    const pct = terminal ? 100 : r ? Math.round(((idx + 1) / STATE_ORDER.length) * 100) : 0;
+    els.mBar.style.width = pct + "%";
+    els.mStep.textContent = r ? STATE_LABEL[st] || st : "Início";
+
+    const slots = (r && r.slots) || {};
+    els.slots.innerHTML = SLOT_LABEL.map(([k, label]) => {
+      let v = slots[k];
+      if (v != null && k === "cep_prefix") v = v + "···-···";
+      if (v != null && k === "plano_id") v = PLAN_LABEL[v] || v;
+      if (v != null && k === "data_inicio") {
+        const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v); if (d) v = `${d[3]}/${d[2]}/${d[1]}`;
+      }
+      return `<dt>${label}</dt><dd class="${v == null ? "empty" : ""}">${v == null ? "—" : escapeHtml(String(v))}</dd>`;
+    }).join("");
+
+    if (r && r.handoff) {
+      els.banner.innerHTML = `<strong>Encaminhado a um especialista</strong>Fila <code>${escapeHtml(r.handoff.queue)}</code> · motivo <code>${escapeHtml(r.handoff.reason)}</code>${r.handoff.security_review ? " · revisão de segurança" : ""}`;
+      els.banner.classList.remove("hidden");
+    } else if (r && st === "ended") {
+      els.banner.innerHTML = "<strong>Atendimento encerrado</strong>Clique em “Nova conversa” para recomeçar.";
+      els.banner.classList.remove("hidden");
+    } else {
+      els.banner.classList.add("hidden");
+    }
+
+    if (r) {
+      els.tech.innerHTML = [
+        ["estado", r.state],
+        ["turno", r.turn_id.split(":").pop()],
+        ["quote_status", QUOTE_STATUS[r.quote_status] ? `${r.quote_status} (${QUOTE_STATUS[r.quote_status]})` : r.quote_status],
+        ["codes", r.codes.length ? r.codes.join(", ") : "—"],
+        ["latência", r._latency != null ? r._latency + " ms" : "—"],
+      ].map(([k, v]) => `<span>${k}: <code>${escapeHtml(String(v))}</code></span>`).join("");
+    } else {
+      els.tech.innerHTML = "<span>Nenhum turno ainda.</span>";
+    }
+
+    const locked = terminal && !!r;
+    els.input.disabled = locked;
+    els.input.placeholder = locked ? "Atendimento finalizado — inicie uma nova conversa" : "Digite sua mensagem…";
+    updateSend();
+  }
+
+  function updateSend() {
+    els.send.disabled = busy || els.input.disabled || !els.input.value.trim();
+  }
+
+  function showTyping() {
+    const row = addRow("bot typing", "<span></span><span></span><span></span><em></em>");
+    const em = row.querySelector("em");
+    const t = setTimeout(() => { em.textContent = "consultando a API de cotação…"; }, 3000);
+    return () => { clearTimeout(t); row.remove(); };
+  }
+
+  // ---------------- rede ----------------
+  async function sendMessage(text) {
+    text = text.trim();
+    if (!text || busy) return;
+    busy = true; updateSend();
+
+    const userEntry = { role: "user", text, ts: Date.now() };
+    state.transcript.push(userEntry); save();
+    renderEntry(userEntry);
+    els.input.value = ""; autosize();
+
+    const stopTyping = showTyping();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    const started = performance.now();
+    try {
+      const res = await fetch(API_CHAT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ session_id: state.sessionId, message: text }),
+        signal: ctrl.signal,
+      });
+      if (res.status === 429) throw new Error("Muitas mensagens em pouco tempo. Aguarde alguns segundos e tente de novo.");
+      if (res.status === 422) throw new Error("Mensagem não aceita pela API (formato inválido).");
+      if (!res.ok) throw new Error(`O agente respondeu com erro (HTTP ${res.status}).`);
+      const data = await res.json();
+      data._latency = Math.round(performance.now() - started);
+      stopTyping();
+
+      // O card de cotação só aparece no turno em que a cotação muda (evita repetir a cada mensagem).
+      const prevId = state.last && state.last.quote ? state.last.quote.quote_id + state.last.quote.plano_id : null;
+      const curId = data.quote ? data.quote.quote_id + data.quote.plano_id : null;
+      const botEntry = { role: "bot", text: data.reply, ts: Date.now(), quote: curId && curId !== prevId ? data.quote : null };
+      state.transcript.push(botEntry);
+      state.last = data; save();
+      renderEntry(botEntry);
+      renderPanel(data);
+    } catch (err) {
+      stopTyping();
+      const msg = err.name === "AbortError"
+        ? "O agente demorou demais para responder. Tente novamente."
+        : (err instanceof TypeError ? "Sem conexão com o agente." : err.message);
+      const row = addRow("error", escapeHtml(msg) + '<button class="btn retry" type="button">Reenviar</button>');
+      row.querySelector(".retry").addEventListener("click", () => {
+        row.remove();
+        state.transcript = state.transcript.filter((e) => e !== userEntry); save();
+        els.messages.lastElementChild?.classList.contains("user") && els.messages.lastElementChild.remove();
+        busy = false;
+        sendMessage(text);
+      }, { once: true });
+    } finally {
+      clearTimeout(timer);
+      busy = false; updateSend();
+      if (!els.input.disabled) els.input.focus({ preventScroll: true });
+    }
+  }
+
+  async function checkHealth() {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      const res = await fetch(API_HEALTH, { signal: ctrl.signal, cache: "no-store" });
+      clearTimeout(t);
+      if (!res.ok) throw new Error();
+      const h = await res.json();
+      const breaker = h.quote_client && h.quote_client.breaker_state;
+      const reachable = !h.quote_service || h.quote_service.reachable;
+      if (h.status === "ok" && reachable && breaker !== "open") {
+        setStatus("ok", `Online · v${h.version}`);
+      } else {
+        setStatus("degraded", !reachable ? "API de cotação fora" : "Circuito aberto");
+      }
+    } catch {
+      setStatus("down", "Agente offline");
+    }
+  }
+  function setStatus(s, text) { els.status.dataset.s = s; els.statusText.textContent = text; }
+
+  // ---------------- eventos ----------------
+  function autosize() {
+    els.input.style.height = "auto";
+    els.input.style.height = Math.min(els.input.scrollHeight, 140) + "px";
+  }
+  els.input.addEventListener("input", () => { autosize(); updateSend(); });
+  els.input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(els.input.value); }
+  });
+  els.form.addEventListener("submit", (e) => { e.preventDefault(); sendMessage(els.input.value); });
+  els.messages.addEventListener("click", (e) => {
+    const chip = e.target.closest(".chip");
+    if (chip) sendMessage(chip.dataset.msg);
+  });
+  els.reset.addEventListener("click", () => {
+    if (busy) return;
+    state = fresh(); save();
+    els.messages.querySelectorAll(".row").forEach((r) => r.remove());
+    els.welcome.classList.remove("hidden");
+    renderPanel(null);
+    els.input.focus();
+  });
+
+  // ---------------- boot ----------------
+  state.transcript.forEach(renderEntry);
+  renderPanel(state.last);
+  checkHealth();
+  setInterval(checkHealth, 30000);
+})();
+</script>
+</body>
+</html>
