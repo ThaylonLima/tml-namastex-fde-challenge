@@ -74,6 +74,8 @@ identificador direto em texto livre. O dataset é sintético, mas **deve ser tra
 - **Identificadores externos**: o `session_id` do canal (pode ser telefone) é pseudonimizado (HMAC) na
   borda; logs, SQLite e pacotes de handoff só conhecem a referência. A persistência **recusa** gravar
   CEP completo, CPF, e-mail ou telefone; o CEP completo nunca vai a disco (sessão restaurada pede de novo).
+- **Idempotência e retenção**: o `message_id` de `/chat` nunca é logado cru nem guarda texto de mensagem
+  (só HMAC); sessão **não terminal com cotação ok nunca sai da memória** (ver `docs/ARQUITETURA.md` §13).
 - Bronze (dado bruto) fica fora do alcance de LLM e de logs; acesso restrito e nunca commitado.
   Dados reais, `.env` e segredos **nunca** vão para o git.
 - Testes devem incluir casos de vazamento (property/regex tests) garantindo que logs e

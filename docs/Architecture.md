@@ -481,3 +481,88 @@ e `logs/EXECUCAO_COMPLETA.md`; o script **falha** se o JSONL contiver os valores
 ### 12.6 Limites desta etapa
 Imagem Docker não foi construída na sessão de desenvolvimento (sem daemon); SQLite de processo único; sem canal
 WhatsApp real (a borda é `POST /chat`); provedor Anthropic só validado com HTTP mockado.
+
+## 13. Revisão da interface web e endurecimento (`fix/web-review`)
+
+Origem: revisão da interface web (R1–R7 + achados novos). Decisão do owner: corrigir em branch própria, com
+PR, **sem dependências novas**. As decisões abaixo foram escritas **antes** do código (design-first).
+Ficam fora de escopo, por decisão explícita: fechar endpoints admin por padrão, criar `GET /status`,
+alterar `quote-service/` ou os arquivos originais do desafio.
+
+### 13.1 B1 — Idempotência de `POST /chat` por `message_id`
+
+Problema medido: reenviar uma mensagem já processada (504 depois do processamento, reload com requisição em
+voo) avança a FSM de novo — infla `turn`/`stagnant_turns`/`slot_attempts`, reenviar um ataque dá H14 na
+hora e 3 reenvios de uma resposta vaga viram H10.
+
+| Item | Decisão |
+|---|---|
+| Contrato | `message_id` **opcional** no `ChatRequest`, padrão `^[A-Za-z0-9_-]{8,64}$`. Sem ele, comportamento idêntico ao atual. Versão da API sobe para **0.5.0** |
+| Onde | Dentro do **lock da sessão**, como **primeira operação** — antes de qualquer mutação (`turn`, `followups_sent`, `last_activity`, consumo de `pending_notice`, `_persist`). Só consulta a sessão **já em memória** (não cria nem restaura) |
+| Snapshot | O `ChatResponse` completo (sem o eco do `session_id`) é calculado **dentro do lock** e gravado no cache antes de liberar. Replay devolve o snapshot, nunca reconstrói a partir do estado atual. Para isso a montagem da resposta saiu de `app.py`, que a fazia depois do lock, e virou um callback executado pelo agente (`Agent.handle_turn`) |
+| Replay | Mesmo `message_id` + mesma mensagem ⇒ corpo **idêntico**, header `X-Idempotent-Replay: true`. Nada é persistido nem alterado; gera o evento de log `chat_replay` (sem PII) |
+| Conflito | Mesmo `message_id` + mensagem diferente ⇒ **HTTP 409**, sem processar. A comparação usa **HMAC-SHA256 com chave aleatória do processo**; o texto cru **nunca** é guardado no cache (LGPD) |
+| Cache | Só respostas 200. Janela: últimos **50** ids por sessão. Somente memória, vive no objeto `Session` (não entra em `to_record()`), logo some junto com a sessão |
+| Log | O `message_id` cru nunca é logado: no máximo `message_ref` = 8 hex de SHA-256 |
+| Limitação | Após reinício do processo ou remoção da sessão (B2) o reenvio **reprocessa** (o cache não é persistido de propósito) |
+
+### 13.2 B2 — Ciclo de vida das sessões em memória
+
+Problema medido: `Agent.sessions` e `_locks` nunca eram removidos (~1 KiB de RAM + 0,6 KiB de SQLite por
+sessão, com `session_id` escolhido pelo cliente).
+
+**Regra de proteção (invariante):** uma sessão **não terminal** com `quote_status == "ok"` **nunca** sai da
+memória — nem por TTL, nem por teto. Motivo: a restauração do SQLite descarta a cotação
+(`restored_without_quote`), e o `sweep_idle` passaria a *expirar* o lead quente em vez de aplicar o H11.
+
+| Classe | Regra de remoção da memória |
+|---|---|
+| Terminal (`HANDOFF`/`ENDED`) | só depois da **carência** `SESSION_TERMINAL_GRACE_SECONDS` (padrão 3600 s) sem atividade; nunca na hora. O sweep marca `last_activity` ao encerrar, então a carência conta a partir do fim |
+| Não terminal **sem** cotação | após inatividade > `SESSION_INACTIVE_TTL_SECONDS` (padrão 21600 s). **Invariante validado na carga:** `TTL > FOLLOWUP_AFTER_SECONDS × (MAX_FOLLOWUPS + 1)` (ciclo completo de follow-ups); violação ⇒ `ValueError` ao iniciar |
+| Não terminal **com** cotação ok | **protegida** |
+| Teto `SESSION_MAX_IN_MEMORY` (padrão 10 000) | ao inserir uma sessão nova: descarta terminais (mais antigas primeiro), depois não terminais sem cotação (mais antigas primeiro); nunca as protegidas. **Se só restarem protegidas, a sessão nova é aceita** e é registrado um alerta (`session_cap_protected_only`): recusar um lead com cotação seria pior |
+| Em andamento | nunca remover sessão com lock adquirido **ou** com turno aguardando o lock (contador `in-flight`); a checagem e a remoção são síncronas, **sem `await` entre elas** |
+
+- **Gatilho (sem dependência nova):** varredura **oportunista** — a cada `handle_turn`, no máximo a cada
+  30 s, examina um lote limitado (64 sessões, cursor rotativo); e uma passada completa em `sweep_idle()`.
+  Escolhida em vez de uma tarefa no `lifespan` porque funciona igual sob `ASGITransport`/CLI (que não executam
+  o lifespan), usa o relógio injetável e é determinística nos testes; sem tráfego não há crescimento a conter.
+- **Consequência documentada:** uma sessão removida em `CONFIRMING` volta a `QUALIFYING` ao ser restaurada e
+  **pede o CEP de novo** (o CEP completo nunca vai a disco). Sem SQLite configurado a remoção é definitiva.
+- **Leitura administrativa:** `GET /sessions/{id}` passa a **não** reinserir a sessão na memória (`peek_session`).
+- **Retenção no SQLite:** sessões **terminais** são apagadas após `SESSION_RETENTION_DAYS` (padrão **30**);
+  depois disso `/sessions/{id}` devolve 404 e um lead que volta começa do zero. Sessões não terminais não são
+  apagadas (o sweep as encerra). A purga roda no `sweep_idle()` e, no máximo 1×/hora, na varredura oportunista.
+- **O sweep precisa ser agendado em produção.** Sem ele não há follow-ups, H11 nem fechamento das sessões
+  protegidas (que, por regra, ficam na memória). Exemplo no README.
+
+### 13.3 A — Interface e proxy
+
+| # | Decisão |
+|---|---|
+| R1 | `upstream` com `zone` + `server agent:8080 resolve;` + `resolver 127.0.0.11 valid=10s;` (nginx open source ≥ 1.27.3; mantém `keepalive`). Imagem fixada em `nginx:1.28-alpine`. `depends_on: agent: condition: service_healthy`. **Fallback documentado** (`set $agent_upstream` + `rewrite … break` + `proxy_pass http://$agent_upstream`): funciona sem `resolve`, mas **perde o keepalive do upstream**. Comportamento do nginx na subida com `agent` ainda não resolvível: **não confirmado em documentação oficial acessível** ⇒ item da lista de validação no servidor; o `service_healthy` evita a situação no fluxo normal |
+| R2 | `/autoseguro/api/health` e a zona `health` **removidos**. Healthcheck do `web` aponta para `/autoseguro/`. A UI começa em "desconhecido" e infere o status pelo resultado do `/chat` (sucesso, erro de rede, 5xx, `quote_status` de falha) |
+| R3 | `ports: !override` em `agent` e `quote-api` do `docker-compose.web.yml`, presos a `127.0.0.1`. **Requer Docker Compose ≥ 2.24.4** ([doc oficial de merge](https://docs.docker.com/reference/compose-file/merge.md)). Endpoints admin seguem como no código; em ambiente público a proteção é `ADMIN_TOKEN` no `.env` |
+| R6 | `set_real_ip_from` restrito à sub-rede **fixada no compose** (`172.29.77.0/24`) + `real_ip_header CF-Connecting-IP`; a chave do rate limit é `$binary_remote_addr` (o header só vale se vier da rede do compose) |
+| LGPD | `log_format` próprio **sem IP, sem user-agent e sem query string** (rota normalizada em `ui`/`chat`/`other`); `limit_req_log_level warn` + `error_log … crit` via `nginx.main.conf` próprio. **Resíduo:** eventos de nível `crit`+ do nginx (raros) podem trazer o IP do cliente; e, com o limiar em `crit`, falhas de upstream deixam de aparecer no `error_log` (diagnóstico pelo status no access log e pelos logs do agente). O uvicorn deixa de imprimir access log (`--no-access-log`; o `http_request` JSONL o substitui) |
+| Endurecimento | `proxy_connect_timeout 3s`, `client_header_timeout 10s`, `client_body_timeout 10s` |
+| UI | "Reenviar" sem reordenar bolhas, sem forçar `busy=false` e sem requisição concorrente; `message_id` por mensagem (fallback sem `crypto.randomUUID`), guardado no transcript e **reutilizado no Reenviar**; ao recarregar com mensagem do usuário sem resposta, reenvia com o **mesmo** `message_id` (replay, sem duplicar); **409** ⇒ novo id + aviso; texto humano para H1–H14 e C1; destaque para `quote_status` de falha; transcript **não é persistido** após estado terminal |
+
+### 13.4 Deploy e rollback atômicos (agente e interface do mesmo commit)
+
+A interface nova envia `message_id`; o agente antigo o rejeita com **422** (`extra="forbid"`). Portanto:
+
+- **Deploy:** `git checkout <sha>` → `docker compose -f docker-compose.yml -f docker-compose.web.yml build agent web` →
+  `up -d agent` (esperar `healthy`) → `up -d web`. Ordem **agente → web**: agente novo aceita a interface antiga
+  (campo opcional).
+- **Rollback:** `git checkout <sha-anterior>` → `build agent web` → `up -d web` → `up -d agent`. Ordem **web → agente**:
+  nunca deixar a interface nova falando com o agente antigo. Abas abertas com o JS novo veem 422 até recarregar.
+
+### 13.5 Validação que só pode ser feita no servidor (esta sessão não tem nginx nem Docker)
+
+Versão do Compose ≥ 2.24.4 (`docker compose version`) · `nginx -t` na imagem `nginx:1.28-alpine` · R1: recriar o
+`agent` (`up -d --force-recreate agent`) e confirmar que o chat continua sem reiniciar o `web` · subida do `web`
+com `agent` parado (comportamento do `resolve`) · 403 (GET no chat) / 404 (rotas admin e `/api/health`) / 429 ·
+portas 8000/8080 só em loopback (`ss -ltn`) · IP real no rate limit (duas origens → buckets distintos) · ausência
+de IP/query nos logs do `web` (`docker compose logs web`) · `message_id` ponta a ponta, incluindo **reload com
+mensagem órfã** · sweep agendado funcionando.
