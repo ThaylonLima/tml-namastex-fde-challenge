@@ -24,4 +24,4 @@ ENV QUOTE_API_URL=http://quote-api:8000 \
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s \
   CMD ["/srv/.venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=2).status == 200 else 1)"]
-CMD ["/srv/.venv/bin/uvicorn", "agent.app:production_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["/srv/.venv/bin/uvicorn", "agent.app:production_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
