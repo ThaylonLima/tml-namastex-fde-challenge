@@ -558,6 +558,15 @@ A interface nova envia `message_id`; o agente antigo o rejeita com **422** (`ext
 - **Rollback:** `git checkout <sha-anterior>` → `build agent web` → `up -d web` → `up -d agent`. Ordem **web → agente**:
   nunca deixar a interface nova falando com o agente antigo. Abas abertas com o JS novo veem 422 até recarregar.
 
+**Primeiro deploy (sub-rede fixa).** O `docker-compose.web.yml` fixa `172.29.77.0/24` na rede `default`, o que altera uma
+rede já existente: (1) checar colisão (`docker network ls -q | xargs docker network inspect`); (2) `docker compose -f
+docker-compose.yml -f docker-compose.web.yml down` (**sem `-v`**: `agent-data` é preservado) e depois `up -d --build`,
+com janela de indisponibilidade; (3) no servidor usar **sempre os dois arquivos** (só o oficial recriaria a rede com outra
+sub-rede e o `set_real_ip_from` deixaria de confiar no proxy).
+
+**Sweep em produção:** sempre contra o servidor em execução (`curl -X POST -H "X-Admin-Token: …" http://127.0.0.1:8080/maintenance/sweep`
+ou `agent.cli sweep --url …`); o modo em processo restaura sessões sem cotação e concorre no SQLite.
+
 ### 13.5 Validação que só pode ser feita no servidor (esta sessão não tem nginx nem Docker)
 
 Versão do Compose ≥ 2.24.4 (`docker compose version`) · `nginx -t` na imagem `nginx:1.28-alpine` · R1: recriar o
@@ -573,3 +582,9 @@ nginx 1.24 real com o `nginx.conf` + agente real + Chromium (Playwright): 403/40
 no rate limit, ausência de IP/query nos logs, `message_id` ponta a ponta (inclui reload com mensagem órfã e 409).
 **Não verificado** (exige Docker e/ou nginx ≥ 1.27.3): `!override`, `resolve` ao vivo, agente recriado, subida do
 `web` com `agent` ausente, bind em loopback — itens acima, a executar no servidor.
+
+#### Limitações registradas na revisão (não bloqueantes)
+
+- `_make_room` acima do teto ordena as sessões (O(n log n)) a cada sessão nova e repete o alerta quando só há protegidas.
+- O rótulo "não enviada" da UI pode aparecer para mensagem processada após timeout (o reenvio faz replay).
+- `--no-access-log` corrige um vazamento **pré-existente**: o access log do uvicorn gravava o caminho cru de `/sessions/{session_id}`.

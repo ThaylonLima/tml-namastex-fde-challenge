@@ -58,13 +58,13 @@ uv run uvicorn agent.app:production_app --factory --port 8080            # API d
 uv run python -m agent.cli chat                       # conversa interativa (/estado, /sair)
 uv run python -m agent.cli demo --spawn-quote         # 4 cenários automatizados, sobe o legado sozinho
 uv run python -m agent.cli health                     # config ativa + circuit breaker
-uv run python -m agent.cli sweep                      # follow-ups / encerramento de sessões inativas
+uv run python -m agent.cli sweep --url http://127.0.0.1:8080   # follow-ups / encerramento (contra o servidor rodando)
 ```
 
 **Testes e lint:**
 
 ```bash
-uv run pytest -q            # 522 testes (unitários, segurança adversarial, integração ponta a ponta)
+uv run pytest -q            # 525 testes (unitários, segurança adversarial, integração ponta a ponta)
 uv run ruff check agent tests scripts/run_reference_execution.py
 uv run ruff format --check agent tests scripts/run_reference_execution.py
 ```
@@ -196,9 +196,10 @@ das mensagens (CPF/CEP soltos, dados fora de ordem). Ele não alimenta preços n
   completo de follow-ups); no teto `SESSION_MAX_IN_MEMORY` expulsa terminais e depois as inativas mais antigas (se só restam
   protegidas, aceita a nova e registra alerta). Sessão com turno em andamento nunca é removida.
 - **Retenção no SQLite**: sessões terminais são apagadas após `SESSION_RETENTION_DAYS` (padrão 30).
-- **O sweep precisa ser agendado** (o agente não tem scheduler). Exemplo de cron a cada 5 min:
-  `*/5 * * * * cd /opt/autoseguro && uv run python -m agent.cli sweep` ou
-  `curl -fsS -X POST -H "X-Admin-Token: $ADMIN_TOKEN" http://127.0.0.1:8000/maintenance/sweep`.
+- **O sweep precisa ser agendado** (o agente não tem scheduler) e **sempre contra o servidor em execução**, a cada 5 min:
+  `*/5 * * * * curl -fsS -X POST -H "X-Admin-Token: $ADMIN_TOKEN" http://127.0.0.1:8080/maintenance/sweep`
+  (ou `agent.cli sweep --url http://127.0.0.1:8080`). **Não use `agent.cli sweep` sem `--url` com o servidor rodando**:
+  o modo em processo restaura sessões do SQLite sem a cotação (expira leads quentes em vez de aplicar o H11) e disputa a escrita do banco.
 
 ### Interface web (extra, `web/`)
 
@@ -208,7 +209,7 @@ LGPD nos logs, deploy e rollback: [`web/README.md`](web/README.md) e `docs/ARQUI
 
 ## 8. Qualidade
 
-522 testes (435 originais, inalterados, + idempotência, TTL, contrato web e scanner de ai-logs): cliente HTTP (retry/deadline/breaker/cache), mascarador (fuzz + dataset inteiro), segurança
+525 testes (435 originais, inalterados, + idempotência, TTL, contrato web, CLI sweep e scanner de ai-logs): cliente HTTP (retry/deadline/breaker/cache), mascarador (fuzz + dataset inteiro), segurança
 adversarial (LLM simulado que obedece ao atacante), FSM/slots/números por extenso, matriz H1–H14+C1 parametrizada
 contra o agente real, API, persistência e inatividade. Cada regra crítica foi validada por **teste de mutação manual**
 (desligar a defesa derruba um teste); os mutantes que sobreviveram revelaram lacunas que viraram testes.
@@ -225,6 +226,10 @@ contra o agente real, API, persistência e inatividade. Cada regra crítica foi 
 - Injeção semântica sem palavras-chave escapa da detecção; a defesa nesse caso é estrutural (confinamento + guardrails + handoff).
 - Idempotência e janela de replay são por processo (memória): após reinício do agente um reenvio é reprocessado.
 - Validações que exigem Docker/nginx ≥ 1.27.3 (Compose `!override`, `resolve` ao vivo, bind em loopback) estão listadas em `docs/ARQUITETURA.md` §13.5 e não foram executadas nesta sessão.
+- Custo de `_make_room` acima do teto: ordenação O(n log n) a cada sessão nova e alerta repetido quando só há sessões protegidas.
+- Na UI web, o rótulo "não enviada" pode aparecer para mensagem processada após o timeout do navegador (o reenvio faz replay).
+- **Achado da revisão (pré-existente):** o access log do uvicorn gravava o caminho cru de `/sessions/{session_id}`; o
+  `--no-access-log` do `Dockerfile` o corrige.
 - Persistência em SQLite local de processo único; escala horizontal exigiria um store compartilhado (a interface já existe).
 
 ## 10. Estrutura

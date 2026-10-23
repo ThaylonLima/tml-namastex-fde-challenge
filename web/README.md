@@ -37,6 +37,10 @@ docker compose -f docker-compose.yml -f docker-compose.web.yml up -d --build
   O Cloudflare e o Docker mantêm os próprios logs (fora do alcance deste repositório).
 - **Cache de idempotência é só memória:** após reinício do agente (ou remoção da sessão) um reenvio é **reprocessado**.
 - **CSP** mantém `'unsafe-inline'` em script/estilo (página única). Migrar para hash/arquivo externo é um endurecimento futuro.
+- **Achado da revisão (pré-existente):** o access log do uvicorn gravava o caminho cru de `GET /sessions/{session_id}`
+  (que pode ser telefone). O `--no-access-log` no `Dockerfile` corrige isso; o agente loga só por `message_ref`/`request_id`.
+- **Rótulo "não enviada":** pode aparecer para uma mensagem que o agente processou depois do timeout do navegador; o reenvio
+  com o mesmo `message_id` devolve a resposta original (replay), então nada é duplicado.
 - A rota do agente aceita qualquer visitante: o limite é o rate limit por IP (30 msg/min, rajada 10).
 
 ## Fallback sem `resolve` (nginx < 1.27.3)
@@ -62,6 +66,24 @@ Não confirmei, em documentação oficial acessível, se o nginx ≥ 1.27.3 inic
 iniciar quando o nome do `upstream` com `resolve` não resolve no carregamento. Por isso o compose usa `service_healthy` e
 **este comportamento está na lista de validação no servidor** (docs/ARQUITETURA.md §13.5).
 
+## Primeiro deploy: sub-rede fixa (altera a rede padrão existente)
+
+O `docker-compose.web.yml` fixa `172.29.77.0/24` na rede `default`. Uma rede já criada pelo compose oficial tem outra
+sub-rede, e o Compose não a altera em `up`: é preciso **recriá-la**. Procedimento (janela de indisponibilidade de
+alguns segundos a poucos minutos, com build):
+
+```bash
+# 1) checar colisão ANTES (nenhuma rede existente pode usar 172.29.77.0/24)
+docker network ls -q | xargs docker network inspect --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}'
+# 2) derrubar com os DOIS arquivos (SEM -v: o volume agent-data é preservado) e subir de novo
+docker compose -f docker-compose.yml -f docker-compose.web.yml down
+docker compose -f docker-compose.yml -f docker-compose.web.yml up -d --build
+```
+
+Se houver colisão, troque a sub-rede em `docker-compose.web.yml` **e** em `web/nginx.conf` (`set_real_ip_from`).
+No servidor use **sempre os dois arquivos juntos**: rodar só o `docker-compose.yml` recria a rede padrão com outra
+sub-rede e o `set_real_ip_from` deixa de confiar no proxy (o rate limit passaria a ver o IP do próprio Cloudflare/Docker).
+
 ## Deploy e rollback (agente e interface do MESMO commit)
 
 A interface nova envia `message_id`; o agente anterior responde **422** (`extra="forbid"`).
@@ -82,14 +104,18 @@ Abas já abertas com o JS novo recebem 422 até recarregar a página depois de u
 
 ## Agendar o sweep (produção)
 
-Sem o sweep não há follow-ups, H11 nem fechamento das sessões protegidas. Exemplos:
+Sem o sweep não há follow-ups, H11 nem fechamento das sessões protegidas. **Em produção o sweep SEMPRE chama o servidor
+em execução** (as sessões vivas estão na memória dele):
 
 ```bash
-# cron a cada 5 min, via endpoint (com ADMIN_TOKEN)
+# cron a cada 5 min (o agente escuta em 127.0.0.1:8080; ADMIN_TOKEN vem do .env)
 */5 * * * * curl -fsS -X POST -H "X-Admin-Token: $ADMIN_TOKEN" http://127.0.0.1:8080/maintenance/sweep >/dev/null
-# ou via CLI do repositório
-*/5 * * * * cd /srv/autoseguro && uv run python -m agent.cli sweep
+# equivalente via CLI, também contra o servidor:
+*/5 * * * * cd /srv/autoseguro && uv run python -m agent.cli sweep --url http://127.0.0.1:8080
 ```
+
+**Não use `agent.cli sweep` sem `--url` com o servidor rodando**: ele cria um app em processo, restaura sessões do SQLite
+sem a cotação (expira leads quentes em vez de aplicar o H11) e disputa a escrita do banco. A CLI avisa isso em stderr.
 
 As ações devolvidas (`follow_up`, `expired`, `handoff_h11`) precisam ser entregues pelo canal; o agente não envia mensagens sozinho.
 
